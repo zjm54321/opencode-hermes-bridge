@@ -1,0 +1,16 @@
+{
+  "name": "opencode-hermes-bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "GPL-3.0-or-later",
+  "exports": { ".": "./dist/index.js", "./core": "./dist/core.js", "./source": "./src/index.ts" },
+  "files": ["dist", "src"],
+  "scripts": {
+    "test": "bun test tests/unit",
+    "test:integration": "bun test tests/integration --only-failures",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/index.ts src/core.ts --target=node --outdir=dist --external @opencode/plugin"
+  },
+  "dependencies": { "@opencode/plugin": "2.0.24" },
+  "devDependencies": { "@types/bun": "1.3.11", "typescript": "5.9.3" }
+}

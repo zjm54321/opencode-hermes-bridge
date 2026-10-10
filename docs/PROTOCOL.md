@@ -21,7 +21,7 @@
 
 ## 2. HTTP 接口规范
 
-- **默认监听地址**：`http://127.0.0.1:8787`。生产环境若需远程调用，必须自行搭建 TLS 反向代理或加密隧道。
+- **默认监听地址**：`http://127.0.0.1:8787`。远程 HTTP 需要受信网络访问控制（如局域网访问控制、禁止暴露公网）；不可信网络建议前置 TLS 反向代理或加密隧道。
 - **传输层鉴权**：请求必须携带 `Authorization: Bearer <TOKEN>` 头部。Token 必须为非空 ASCII 字符串，且不得包含空白字符或控制字符。服务端使用常量时间比对（`hmac.compare_digest`）校验。
 - **传输报文限制**：单次 HTTP 请求与响应体上限均为 32 MiB（`Content-Length` 超过 32 MiB 拒绝）。
 
@@ -124,11 +124,31 @@
   - 重启时检查 SQLite：原处于 `running` 状态的任务一律更新为 `status='failed'`，错误码为 `restart`（“Companion restarted during execution; job was not replayed.”），严防模型自动重放带来的副作用与外部开销；
   - 原处于 `queued` 状态的任务保持排队，等待启动后由 Worker 继续调度。
 
-### 3.3 会话历史与 Hermes 上下文
+### 3.3 会话历史、模型路由与凭据处理边界
 
 - **对话历史持久化**：以 `threadId` 为主键保存在 Companion 的 SQLite `threads` 表中。
 - **与 Hermes CLI 隔离**：Companion 中的 `threadId` 不会连接或恢复 Hermes CLI 原有的会话记录或数据库。
-- **首版模型配置约定**：Companion 启动时通过命令行参数 `--model` 或环境变量 `HERMES_MODEL` 显式指定模型；启动前必须确立 `HERMES_HOME` 环境变量以载入环境；Companion 并不包含 Hermes CLI 的动态 Provider 路由。若需特定 Provider，须由部署者在 Hermes 环境内部完成配置。
+- **模型参数要求**：Companion 启动时通过命令行参数 `--model` 或环境变量 `HERMES_MODEL` 显式指定模型标识。Hermes 底层 `AIAgent` 仅接收 `model` 参数并不等同于 Hermes CLI 已在多模型/多 Provider 间完成路由解析。
+- **显式模型路由组规范（可选）**：
+  若需要将 Hermes 推理请求显式导向自定义网关，支持通过以下环境变量定义路由契约：
+  - `HERMES_BRIDGE_PROVIDER`：Provider 名称（例如 `custom`）。
+  - `HERMES_BRIDGE_BASE_URL`：模型网关基地址（例如 `http://model-gateway.internal:8084/v1`）。必须为 HTTP(S) URL 并包含主机名，严禁包含用户信息凭证（userinfo）、查询参数（`?`）或片段标识（`#`），允许路径如 `/v1`。
+  - `HERMES_BRIDGE_API_MODE`：接口模式，当前版本固定且仅允许 `chat_completions`。
+  - `HERMES_BRIDGE_API_KEY_ENV`：承载模型 API Key 的环境变量名称，缺省为 `HERMES_BRIDGE_MODEL_API_KEY`。必须为合法环境变量名标识符（`^[A-Za-z_][A-Za-z0-9_]*$`），其所指代的环境变量值在启动环境中必须非空。
+- **完整性约束与快速失败（Fail-Fast）**：
+  - 当上述 4 个变量中有任意一个存在时，要求 `HERMES_BRIDGE_PROVIDER`、`HERMES_BRIDGE_BASE_URL` 与 `HERMES_BRIDGE_API_MODE` 必须全部非空具备，否则直接抛出异常拒绝启动。
+  - 路由校验在 Companion 启动初期执行，先于工作区目录准备、排他锁获取及后台 Worker 线程初始化。
+  - 启动失败输出固定的脱敏错误提示，不回显密钥内容，不打印 Traceback。
+- **凭据生命周期与存储边界**：
+  - 模型 API Key 在 `HermesRunner` 构造阶段从环境捕获至进程私有属性中（在导入 Hermes 库前捕获，防止被 Hermes 自身加载 profile 的 `.env` 覆盖）。
+  - Bridge 自身处理流程不会主动将该密钥写入任务请求对象、SQLite 数据库（`bridge.sqlite3`）、Outbox 存储、HTTP 响应报文或自身日志；该密钥仅作为 `api_key` 参数透传给 `AIAgent(**options)`。
+  - Python 进程私有属性并非机密隔离机制；密钥传入 `AIAgent` 后的记录行为、异常捕获或网络调用受外部库实现约束，外部运行时与工具的日志、环境及文件系统访问权限须由部署者另行配置限制。
+- **两类凭据职责边界**：
+  - `HERMES_BRIDGE_TOKEN`：OpenCode 插件访问 Companion 服务的 Bearer Token。
+  - 模型 API Key（`HERMES_BRIDGE_MODEL_API_KEY` 或自定义变量）：Hermes 访问底层模型网关的鉴权密钥。
+  - 两类凭据服务于不同链路与安全域，建议分别配置专用密钥，避免混用。
+- **未启用显式路由时的旧模式兼容**：
+  - 若未设置上述显式路由变量，Companion 维持原有行为，仅向 `AIAgent` 传递 `session_id`、`model` 与 `quiet_mode`，依赖 Hermes 自身加载的环境变量（如 `HERMES_HOME` 下对应 profile 的配置），不支持亦不声称自动兼容 Hermes CLI 的动态 Provider 路由。示例模型仅作配置参考，不保证任意模型路由一定兼容。
 
 ---
 

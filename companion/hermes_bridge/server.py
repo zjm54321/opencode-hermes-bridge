@@ -137,7 +137,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Authenticated local Hermes companion (remote use requires your own TLS reverse proxy). Set HERMES_HOME in the process environment before launch; do not switch profiles at runtime.")
+    parser = argparse.ArgumentParser(description="Authenticated Hermes companion; remote HTTP requires trusted-network access controls, and untrusted networks should use TLS. Set HERMES_HOME in the process environment before launch; do not switch profiles at runtime.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--workspace", type=Path, default=Path.home() / ".local/share/opencode-hermes-bridge")
@@ -150,12 +150,16 @@ def main() -> None:
         parser.error("HERMES_BRIDGE_TOKEN must be nonempty.")
     if not args.model or not args.model.strip():
         parser.error("An explicit model is required via --model or HERMES_MODEL.")
+    try:
+        runner = HermesRunner(model=args.model)
+    except ValueError:
+        parser.error("Invalid Hermes model routing configuration; check HERMES_BRIDGE_PROVIDER, HERMES_BRIDGE_BASE_URL, HERMES_BRIDGE_API_MODE, and HERMES_BRIDGE_API_KEY_ENV and its selected environment variable.")
     os.umask(0o077)
     workspace = private_directory(args.workspace.absolute())
     # Exactly once, before starting threads. Never chdir per request.
     os.chdir(workspace)
     try:
-        service = JobService(workspace, HermesRunner(model=args.model))
+        service = JobService(workspace, runner)
     except Exception:
         parser.error("Unable to open private workspace; check permissions and ensure no other companion owns it.")
     try:

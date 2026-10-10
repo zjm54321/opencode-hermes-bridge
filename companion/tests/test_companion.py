@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import base64
-from contextlib import closing
+from contextlib import closing, redirect_stderr, redirect_stdout
 import hashlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -20,11 +21,15 @@ from uuid import uuid4
 from hermes_bridge import BridgeError, JobService, Limits, RunInput, RunResult
 from hermes_bridge.core import normalize_job, read_output, wire_json
 from hermes_bridge.runner import HermesRunner
-from hermes_bridge.server import BridgeHTTPServer
+from hermes_bridge.server import BridgeHTTPServer, main
 from http_fixture import EchoRunner
 
 
 TOKEN = "test-token-not-production"
+ROUTE = {"HERMES_BRIDGE_PROVIDER": "custom",
+         "HERMES_BRIDGE_BASE_URL": "http://aether.ai-services.svc.cluster.local:8084/v1",
+         "HERMES_BRIDGE_API_MODE": "chat_completions"}
+MODEL_KEY = "sentinel-model-key-never-export"
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6SAAAAABJRU5ErkJggg==")
 FILES = [("pixel.png", "image/png", PNG), ("hello world.txt", "text/plain", "真实 bytes\n".encode()),
          ("bundle.zip", "application/zip", b"PK\x05\x06" + b"\x00" * 18),
@@ -313,6 +318,7 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(BridgeError):
             normalize_job({**job(), "id": "invalid"}, limits)
 
+    @patch.dict(os.environ, {}, clear=True)
     def test_hermes_public_api_adapter(self):
         calls = {}
         class Agent:
@@ -337,6 +343,82 @@ class ValidationTests(unittest.TestCase):
         with patch.dict(os.environ, {"HERMES_MODEL": "  "}):
             with self.assertRaisesRegex(ValueError, "explicit model is required"):
                 HermesRunner(agent_factory=Agent)
+
+    def test_hermes_explicit_route_factory_parameters(self):
+        calls = {}
+        class Agent:
+            def __init__(self, **kwargs):
+                calls["init"] = kwargs
+            def run_conversation(self, **kwargs):
+                calls["run"] = kwargs
+                return {"completed": True, "final_response": "answer", "messages": []}
+        request = RunInput("job", "thread", "text", "text", "system", [], Path("/private/output"), (), ())
+        for custom_key_env in (False, True):
+            for base_url in (ROUTE["HERMES_BRIDGE_BASE_URL"], "https://example.invalid/v1/"):
+                env = {**ROUTE, "HERMES_BRIDGE_BASE_URL": " " + base_url + " ",
+                       "HERMES_BRIDGE_PROVIDER": " custom ", "HERMES_BRIDGE_API_MODE": " chat_completions ",
+                       "HERMES_MODEL": " z-ai/glm-5.3-flash "}
+                key_env = "CUSTOM_MODEL_KEY" if custom_key_env else "HERMES_BRIDGE_MODEL_API_KEY"
+                env[key_env] = MODEL_KEY
+                if custom_key_env:
+                    env["HERMES_BRIDGE_API_KEY_ENV"] = key_env
+                    env["HERMES_BRIDGE_MODEL_API_KEY"] = "unused-default-key"
+                with self.subTest(custom_key_env=custom_key_env, base_url=base_url), patch.dict(os.environ, env, clear=True):
+                    runner = HermesRunner(agent_factory=Agent)
+                    os.environ[key_env] = "changed-after-initialization"
+                    result = runner.run(request)
+                self.assertEqual(calls["init"], {"session_id": "thread", "model": "z-ai/glm-5.3-flash",
+                                              "quiet_mode": True, "provider": "custom", "base_url": base_url,
+                                              "api_mode": "chat_completions", "api_key": MODEL_KEY})
+                self.assertEqual(calls["run"], {"user_message": "text", "system_message": "system",
+                                             "conversation_history": [], "task_id": "job"})
+                self.assertNotIn(MODEL_KEY, repr(request))
+                self.assertNotIn(MODEL_KEY, repr(result))
+                self.assertNotIn(MODEL_KEY, repr(runner._route))
+
+    def test_hermes_route_configuration_fails_fast_and_redacted(self):
+        valid = {**ROUTE, "HERMES_BRIDGE_MODEL_API_KEY": MODEL_KEY}
+        invalid = []
+        for name in ROUTE:
+            invalid.append({key: value for key, value in valid.items() if key != name})
+            invalid.extend([{**valid, name: ""}, {**valid, name: "  "}, {**valid, name: "bad\nvalue"}])
+        invalid.extend([{**valid, "HERMES_BRIDGE_MODEL_API_KEY": ""},
+                        {**valid, "HERMES_BRIDGE_MODEL_API_KEY": "  "}, dict(ROUTE),
+                        {"HERMES_BRIDGE_API_KEY_ENV": "MODEL_KEY"},
+                        {**valid, "HERMES_BRIDGE_API_MODE": "responses"}])
+        for name in ("", "1BAD", "BAD-NAME", "A=B", "BAD NAME", "BAD\nNAME", MODEL_KEY, "é"):
+            invalid.append({**valid, "HERMES_BRIDGE_API_KEY_ENV": name})
+        invalid.append({**valid, "HERMES_BRIDGE_API_KEY_ENV": "UNSET_KEY"})
+        for url in ("ftp://example.invalid/v1", "/v1", "http:///v1", "http://",
+                    f"http://user:{MODEL_KEY}@example.invalid/v1", f"http://example.invalid/v1?key={MODEL_KEY}",
+                    f"http://example.invalid/v1#{MODEL_KEY}", "http://example.invalid/v1?",
+                    "http://example.invalid/v1#", "http://[broken/v1", "http://example.invalid:bad/v1",
+                    "http://example.invalid:65536/v1", "http://example.invalid/white space",
+                    "http://example.invalid/v1\n", "http://example.invalid/\x7f", "http://example.invalid/\x85"):
+            invalid.append({**valid, "HERMES_BRIDGE_BASE_URL": url})
+        def factory(**kwargs):
+            self.fail("Invalid configuration must not invoke the agent factory")
+        for index, env in enumerate(invalid):
+            with self.subTest(case=index), patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(ValueError) as context:
+                    HermesRunner("test-model", agent_factory=factory)
+                self.assertNotIn(MODEL_KEY, str(context.exception))
+
+    def test_server_route_failure_is_sanitized_before_workspace_or_worker(self):
+        env = {**ROUTE, "HERMES_BRIDGE_TOKEN": TOKEN, "HERMES_MODEL": "test-model",
+               "HERMES_BRIDGE_MODEL_API_KEY": MODEL_KEY,
+               "HERMES_BRIDGE_BASE_URL": f"http://user:{MODEL_KEY}@example.invalid/v1"}
+        output = io.StringIO()
+        with patch.dict(os.environ, env, clear=True), patch("sys.argv", ["companion"]), redirect_stderr(output):
+            with patch("hermes_bridge.server.private_directory") as workspace, patch("hermes_bridge.server.JobService") as service:
+                with self.assertRaises(SystemExit) as context:
+                    main()
+                self.assertEqual(context.exception.code, 2)
+                workspace.assert_not_called()
+                service.assert_not_called()
+        self.assertIn("Invalid Hermes model routing configuration", output.getvalue())
+        self.assertNotIn(MODEL_KEY, output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
 
     def test_hermes_completed_and_legacy_results(self):
         class Agent:
@@ -499,6 +581,48 @@ class HTTPTests(unittest.TestCase):
         healthy = job("healthy")
         self.assertEqual(self.request(value=healthy)[0], 202)
         self.assertEqual(wait_done(self.service, healthy["id"])["status"], "completed")
+
+    def test_explicit_route_secret_stays_out_of_http_history_database_and_logs(self):
+        calls = []
+        class Agent:
+            def __init__(self, **kwargs):
+                self.api_key = kwargs["api_key"]
+            def run_conversation(self, **kwargs):
+                calls.append(kwargs)
+                if kwargs["user_message"] == "raise":
+                    raise RuntimeError(self.api_key)
+                if kwargs["user_message"] == "incomplete":
+                    return {"completed": False, "error": self.api_key, "final_response": self.api_key,
+                            "messages": [{"role": "assistant", "content": self.api_key}]}
+                return {"completed": True, "final_response": "safe answer",
+                        "messages": [{"role": "assistant", "content": "safe answer"}]}
+        with patch.dict(os.environ, {**ROUTE, "HERMES_BRIDGE_MODEL_API_KEY": MODEL_KEY}, clear=True):
+            self.service.runner = HermesRunner("test-model", agent_factory=Agent)
+        output, errors = io.StringIO(), io.StringIO()
+        thread = str(uuid4())
+        with redirect_stdout(output), redirect_stderr(errors), self.assertNoLogs():
+            self.service.start()
+            for mode, expected in (("raise", "execution_failed"), ("incomplete", "hermes_incomplete"),
+                                   ("healthy", None), ("followup", None)):
+                value = job(mode, thread=thread)
+                status, submitted = self.request(value=value)
+                self.assertEqual(status, 202)
+                self.assertNotIn(MODEL_KEY, json.dumps(submitted))
+                result = wait_done(self.service, value["id"])
+                self.assertEqual(result["status"], "failed" if expected else "completed")
+                if expected:
+                    self.assertEqual(result["error"]["code"], expected)
+                status, polled = self.request("GET", "/v1/jobs/" + value["id"])
+                self.assertEqual((status, polled), (200, result))
+                self.assertNotIn(MODEL_KEY, json.dumps(polled))
+            with closing(sqlite3.connect(Path(self.temp.name) / "bridge.sqlite3")) as db:
+                self.assertNotIn(MODEL_KEY, "\n".join(db.iterdump()))
+            for path in Path(self.temp.name).rglob("*"):
+                if path.is_file():
+                    self.assertNotIn(MODEL_KEY.encode(), path.read_bytes())
+        self.assertTrue(calls[-1]["conversation_history"])
+        self.assertNotIn(MODEL_KEY, json.dumps(calls))
+        self.assertNotIn(MODEL_KEY, output.getvalue() + errors.getvalue())
 
     def test_malformed_json_and_attachment_validation(self):
         for raw in [b"{", b"null", b"[]", b"NaN", b"\xff", b'{"id":1,"id":2}', b"[" * 1100]:

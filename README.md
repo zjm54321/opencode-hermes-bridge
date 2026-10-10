@@ -97,8 +97,15 @@ export HERMES_REPO="/absolute/path/to/hermes-agent"
 
 # 设置 Hermes 配置目录、鉴权 Token 与显式模型标识
 export HERMES_HOME="/absolute/path/to/hermes-home"
-export HERMES_BRIDGE_TOKEN="your-secure-bearer-token-without-spaces"
+export HERMES_BRIDGE_TOKEN="your-secure-bridge-token-without-spaces"
 export HERMES_MODEL="your-model-id"
+
+# 可选：显式模型路由配置（若连接自建或特定模型网关）
+# export HERMES_BRIDGE_PROVIDER="custom"
+# export HERMES_BRIDGE_BASE_URL="http://model-gateway.internal:8084/v1"
+# export HERMES_BRIDGE_API_MODE="chat_completions"
+# export HERMES_BRIDGE_MODEL_API_KEY="your-model-api-key"
+# export HERMES_BRIDGE_API_KEY_ENV="HERMES_BRIDGE_MODEL_API_KEY"  # 选填，默认即为 HERMES_BRIDGE_MODEL_API_KEY
 
 # 启动服务 (通过 PYTHONPATH 挂载源码，Hermes venv 路径以部署实际为准)
 PYTHONPATH="$BRIDGE_REPO/companion:$HERMES_REPO${PYTHONPATH:+:$PYTHONPATH}" \
@@ -110,15 +117,24 @@ PYTHONPATH="$BRIDGE_REPO/companion:$HERMES_REPO${PYTHONPATH:+:$PYTHONPATH}" \
 ```
 
 > **注意**：
-> - `--model` / `HERMES_MODEL` 请使用具体的模型标识（如 `your-model-id`）。当前 Companion Runner 仅将 `model` 显式传递给 Hermes 的 `AIAgent`，并未暴露 `provider`、`base_url`、`api_mode` 等选项。单纯指定 `HERMES_HOME` 或模型名不保证兼容所有自定义 provider，需按实际部署环境与 Hermes 当前 Python API 进行配置。
+> - `--model` / `HERMES_MODEL` 为**必填项**，必须显式指定具体的模型标识（如示例占位符 `your-model-id`）。Hermes 的底层 `AIAgent` 仅接收模型名称并不等同于 Hermes CLI 已自动选择或判定 provider。
+> - **可选显式路由环境变量**：若需要将请求路由至自定义模型网关，可设置显式路由环境变量组：
+>   - `HERMES_BRIDGE_PROVIDER`：模型服务提供商标识（如 `custom`）。
+>   - `HERMES_BRIDGE_BASE_URL`：模型网关基地址（如 `http://model-gateway.internal:8084/v1`），必须为带主机名的 HTTP(S) URL，严禁包含用户名/密码凭据、查询参数（`?`）或 Hash 片段（`#`），允许 `/v1` 等路径。
+>   - `HERMES_BRIDGE_API_MODE`：接口模式，本版本仅支持 `chat_completions`。
+>   - `HERMES_BRIDGE_API_KEY_ENV`：承载模型 API Key 的环境变量名称，缺省为 `HERMES_BRIDGE_MODEL_API_KEY`。它仅用于选择变量名，所指向的目标环境变量必须包含非空 Key。
+>   - **完整性与快速失败（Fail-Fast）**：当上述任意一个路由环境变量（包括 `HERMES_BRIDGE_API_KEY_ENV`）出现时，要求 `HERMES_BRIDGE_PROVIDER`、`HERMES_BRIDGE_BASE_URL` 和 `HERMES_BRIDGE_API_MODE` 三项完整具备且非空，并在服务端初始化早期完成校验（早于工作区初始化与 Worker 启动）。配置错误采用固定脱敏提示，不回显密钥并立即退出。
+>   - **凭据生命周期与处理边界**：模型 API Key 在导入 Hermes 模块前从环境捕获，作为进程私有属性保存，并透传给 `AIAgent(api_key=...)`。Bridge 自身处理流程不会主动将该密钥写入任务请求、SQLite 数据库、本地 Outbox 或自身的运行日志。启动前请确保已载入正确 profile。需要注意：Python 私有属性并非操作系统级隔离；当密钥传入 `AIAgent` 后，底层 Hermes、上游 Provider SDK、工具以及模型本身的行为是否记录或返回密钥，不属于 Bridge 可控制的保证范围。Hermes 并非执行沙箱，外部运行时与工具的日志、环境及文件系统访问权限须由部署者另行限制。
+>   - **两类凭据职责区分**：用于 OpenCode 插件调用 Companion 的桥接鉴权 `HERMES_BRIDGE_TOKEN`（Bearer Token），与访问上游网关的模型 `HERMES_BRIDGE_MODEL_API_KEY`（网关密钥）属于两类不同用途的凭据，建议分别配置专用的 Bridge Token 与模型网关密钥。
+>   - **旧模式兼容性**：若未设置显式路由组，Companion 保持原有行为（仅向 `AIAgent` 传递 `session_id`、`model` 与 `quiet_mode`），依赖 Hermes 自身内部的环境处理（如 `HERMES_HOME` 下配置），不能声称对 Hermes CLI 的完整动态路由自动兼容。提供模型示例不证明任何第三方模型路由一定兼容。
 
 #### Companion CLI 选项列表
 
 | 参数 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `--host` | `127.0.0.1` | 监听地址。默认仅绑定本地回环，生产暴露远程必须自行前置 TLS 反向代理或加密隧道。 |
+| `--host` | `127.0.0.1` | 监听地址。默认仅绑定本地回环。远程 HTTP 需要受信网络访问控制（如局域网源地址限制、禁止暴露公网）；不可信网络或公网传输建议前置 TLS 反向代理或加密隧道（如 WireGuard/SSH）。 |
 | `--port` | `8787` | 监听端口。 |
-| `--model` | 环境变量 `HERMES_MODEL` | 必填。显式指定 Hermes 调用的模型名称标识。 |
+| `--model` | 环境变量 `HERMES_MODEL` | 必填。显式指定 Hermes 调用的模型名称标识（CLI 模型路由不在此处加载）。 |
 | `--workspace` | `~/.local/share/opencode-hermes-bridge` | 工作区目录，包含 SQLite 数据库、任务锁文件及临时文件。自动设为 `0700` 私有权限。 |
 | `--request-timeout` | `10.0` | 单次 HTTP 请求处理超时秒数。 |
 
@@ -161,7 +177,7 @@ PYTHONPATH="$BRIDGE_REPO/companion:$HERMES_REPO${PYTHONPATH:+:$PYTHONPATH}" \
 | `outputDir` | `HERMES_BRIDGE_OUTPUT_DIR` | 优先读取 `$XDG_STATE_HOME/opencode-hermes-bridge/outputs`，缺省为 `~/.local/state/opencode-hermes-bridge/outputs` | Companion 产物接收后的本地安全保存目录（设为 `0700` 私有权限）。 |
 
 > **关键运维提示**：
-> `HERMES_BRIDGE_TOKEN` **必须注入到 OpenCode 后台服务环境**中。仅为 Companion 单独设置 export 不会自动同步至已启动的 OpenCode 宿主进程。若更新了环境变量或插件配置，必须让 OpenCode 后台服务重新加载以获得最新配置，而不只是重启前端或 TUI 界面。
+> `HERMES_BRIDGE_TOKEN` **必须注入到 OpenCode 后台服务环境**中。仅为 Companion 单独设置 export 不会自动同步至已启动的 OpenCode 宿主进程。需要特别注意：**插件配置可热重载，但后台进程环境变量更新需要重启后台服务**（已运行 daemon 不会自动更新 `process.env`，仅重启 TUI 亦不足以生效；需通过 `opencode service restart` 等方式重启后台服务以使环境生效）。OpenCode 宿主仅需读取 Bridge 端的 URL 与 Bearer Token；显式模型路由相关的环境变量（`HERMES_BRIDGE_PROVIDER`、`HERMES_BRIDGE_BASE_URL` 及模型网关 API Key）仅属于 Companion 进程环境，无需也不应注入 OpenCode 宿主。
 
 ---
 
@@ -248,13 +264,13 @@ PYTHONPATH="$BRIDGE_REPO/companion:$HERMES_REPO${PYTHONPATH:+:$PYTHONPATH}" \
 ## 8. 安全与沙箱责任边界声明
 
 1. **Companion 并非执行沙箱**：Companion 的路径检查（限制在 `uploads/` 与 `output/` 目录）仅用于 HTTP 文件交换的边界防护，**不构成 Hermes Agent 的系统权限沙箱**。Hermes 运行时依然拥有宿主所赋予的环境与工具权限。
-2. **凭证脱敏**：Companion 对模型和工具执行的异常信息进行了脱敏处理，防止底层提供商的 API Key 或敏感环境变量随错误报文泄露至网络。
-3. **网络暴露建议**：服务默认绑定 `127.0.0.1`，鉴权仅通过 Bearer Token 进行。若需跨机器访问，必须自行配置 TLS 反向代理，或 SSH / WireGuard 等加密通道。
+2. **凭据脱敏与处理边界**：Companion 对自身模型与工具执行的异常信息进行了脱敏处理，防止底层提供商的 API Key 或敏感环境变量随错误报文泄露至网络。Bridge 本身不主动持久化或记录显式路由的模型 API Key，但当 Key 透传给 `AIAgent` 后，Hermes、工具或第三方 SDK 的内部行为不受 Bridge 约束，相关执行环境安全须由部署者配置限制。
+3. **网络暴露与访问控制**：服务默认绑定 `127.0.0.1`，鉴权仅通过 Bearer Token 进行。若需在受信任的局域网（LAN）内使用 HTTP 访问，必须实施受信网络访问控制（如内网防火墙源地址白名单、严禁直接暴露于公网）。需要注意：局域网明文 HTTP 传输并不等同于 TLS，亦非绝对安全（Bearer Token 与通信内容在网络链路上仍以明文传输）；在跨公网或不可信网络链路中，强烈建议前置 TLS 反向代理或使用 VPN / 加密隧道。本项目不提供公网开放端点配置指南。
 
 ---
 
 ## 9. 验证现状简述
 
 项目已完成单元测试、跨语言集成测试及最小化实体联调（完整证据与分层矩阵详见 [docs/VERIFICATION.md](docs/VERIFICATION.md)）：
-- **已证实**：TypeScript 单元测试（21 项）、Python 服务端测试（21 项）、跨语言 HTTP 集成测试（3 场景）；真实 OpenCode 宿主（`2.0.24+de2cacd`）成功加载 `dist/` 并注册可用工具；在隔离环境中通过真实 Hermes（`0.21.5`）完成 1 次真实模型文本调用（返回 200 与固定回复），且测试夹具文件字节双向传输 SHA-256 完全匹配。
-- **未证实 / 未运行**：测试文件输出由夹具生成而非模型创建；图像请求在发送前被 Hermes 移除，因此模型视觉理解能力未验证；真实宿主内的模型自主工具选择、权限确认弹窗及后台自动回投全链路 UI 尚未运行测试。测试已清理全部自建资源，未改动现有生产服务。
+- **已证实**：TypeScript 产物构建与类型检查（未变更）、TypeScript 单元测试（21 项 / 145 断言）；Python 服务端测试（25 项，覆盖服务接口、调度队列、错误脱敏，以及新增的显式路由参数捕获、合法性校验、Fail-Fast 拦截与指定测试场景下的凭据扫描）；跨语言 HTTP 集成测试（3 场景 / 105 断言，依托 EchoRunner 回显桩验证字节流通）；真实 OpenCode 宿主（`2.0.24+de2cacd`）成功加载 `dist/` 并注册可用工具；在隔离环境中通过真实 Hermes（`0.21.5`）完成 1 次真实模型文本调用（返回 200 与固定回复），且测试夹具文件字节双向传输 SHA-256 完全匹配。
+- **未证实 / 未运行**：测试文件输出由夹具生成而非模型创建；图像请求在发送前被 Hermes 移除，因此模型视觉理解能力未验证；真实宿主内的模型自主工具选择、权限确认弹窗及后台自动回投全链路 UI 尚未运行测试；新增的显式模型路由能力仅完成 Python 单元测试覆盖，尚未在真实自定义模型网关或新生产环境中进行实机部署验证，不代表任意模型路由一定兼容。测试已清理全部自建资源，未改动现有生产服务。

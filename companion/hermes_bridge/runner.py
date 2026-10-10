@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from .core import BridgeError, RunInput, RunResult
 
@@ -23,6 +25,39 @@ class HermesRunner:
             raise ValueError("An explicit model is required via --model or HERMES_MODEL.")
         self.model = selected_model.strip()
         self._agent_factory = agent_factory
+        self._route: dict[str, str] = {}
+        self._api_key: str | None = None
+        route_names = ("HERMES_BRIDGE_PROVIDER", "HERMES_BRIDGE_BASE_URL", "HERMES_BRIDGE_API_MODE")
+        if any(name in os.environ for name in (*route_names, "HERMES_BRIDGE_API_KEY_ENV")):
+            values = [os.environ.get(name, "") for name in route_names]
+            if any(not value.strip() for value in values):
+                raise ValueError("Explicit routing requires HERMES_BRIDGE_PROVIDER, HERMES_BRIDGE_BASE_URL, and HERMES_BRIDGE_API_MODE.")
+            if any(ord(c) < 32 or 127 <= ord(c) <= 159 for value in values for c in value):
+                raise ValueError("Explicit route fields must not contain control characters.")
+            provider, base_url, api_mode = (value.strip() for value in values)
+            try:
+                parsed = urlsplit(base_url)
+                valid_url = (parsed.scheme in ("http", "https") and bool(parsed.hostname)
+                             and parsed.username is None and parsed.password is None
+                             and "?" not in base_url and "#" not in base_url
+                             and not any(c.isspace() for c in base_url))
+                # Accessing port also rejects malformed/out-of-range ports.
+                parsed.port
+            except ValueError:
+                valid_url = False
+            if not valid_url:
+                raise ValueError("HERMES_BRIDGE_BASE_URL must be an HTTP(S) URL with a hostname and no userinfo, query, or fragment.")
+            if api_mode != "chat_completions":
+                raise ValueError("HERMES_BRIDGE_API_MODE must be chat_completions.")
+            key_env = os.environ.get("HERMES_BRIDGE_API_KEY_ENV", "HERMES_BRIDGE_MODEL_API_KEY")
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key_env) is None:
+                raise ValueError("HERMES_BRIDGE_API_KEY_ENV must be a valid environment variable name.")
+            api_key = os.environ.get(key_env, "")
+            if not api_key.strip():
+                raise ValueError("The environment variable selected by HERMES_BRIDGE_API_KEY_ENV must be nonempty.")
+            self._route = {"provider": provider, "base_url": base_url, "api_mode": api_mode}
+            # Capture before importing Hermes (which may load its own .env).
+            self._api_key = api_key
 
     def run(self, request: RunInput) -> RunResult:
         factory = self._agent_factory
@@ -30,6 +65,9 @@ class HermesRunner:
             from run_agent import AIAgent
             factory = AIAgent
         options: dict[str, Any] = {"session_id": request.thread_id, "model": self.model, "quiet_mode": True}
+        if self._route:
+            options.update(self._route)
+            options["api_key"] = self._api_key
         agent = factory(**options)
         result = agent.run_conversation(
             user_message=request.user_message,

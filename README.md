@@ -138,6 +138,30 @@ PYTHONPATH="$BRIDGE_REPO/companion:$HERMES_REPO${PYTHONPATH:+:$PYTHONPATH}" \
 | `--workspace` | `~/.local/share/opencode-hermes-bridge` | 工作区目录，包含 SQLite 数据库、任务锁文件及临时文件。自动设为 `0700` 私有权限。 |
 | `--request-timeout` | `10.0` | 单次 HTTP 请求处理超时秒数。 |
 
+### 3.2 容器化部署专用入口（hermes_bridge.init）
+
+在容器或 Kubernetes Pod 中部署 Companion 时，若直接将 `hermes_bridge` 作为容器 PID 1，因服务未注册 `SIGTERM` 处理器，无法正常响应容器终止信号且无法回收孤儿进程。为此项目提供了轻量级 PID 1 专用入口：
+
+```bash
+# 容器 Entrypoint 示例（仅限容器内作为真实 PID 1 运行）
+python -m hermes_bridge.init \
+  --host 0.0.0.0 \
+  --port 8787 \
+  --model "$HERMES_MODEL" \
+  --workspace "/data/workspace"
+```
+
+> **运行约束与进程生命周期说明**：
+> - **仅限容器 PID 1**：`hermes_bridge.init` 在启动时校验 `os.getpid() == 1`，非 PID 1 运行将直接拒绝退出。普通本地运行与开发调试仍请使用 `python -m hermes_bridge`，无需使用 init。
+> - **监督与孤儿回收**：父进程作为 PID 1 独立运行并独占 `waitpid` 回收孤儿进程，不干扰子解释器内部的 `subprocess.wait`；实际的 Companion 主服务由子进程通过 `setsid` 隔离启动。
+> - **优雅终止与阶梯超时**：
+>   - 首次收到 `SIGTERM` 或 `SIGINT` 时，转换为向主子进程 PID 发送单次 `SIGINT`（不向整个进程组广播），触发 HTTP 服务优雅关闭；后续重复信号被忽略，不重复转发。
+>   - 设置固定阶梯退出时限：20 秒发送主进程组 `SIGTERM`、25 秒发送进程组 `SIGKILL`、27 秒父进程最终退出。重复接收到信号不会延长或重置超时时间。
+>   - 主进程若提前退出，父进程立即向剩余进程组发送 `SIGTERM`，至多等待 5 秒升级为 `SIGKILL` 并进行至多 2 秒孤儿回收清理（若所有子进程已退出则在 `waitpid` 报 `ECHILD` 时提早结束，不强制等待满 7 秒；此阶段新到达的外部信号同样不延长清理期限）。
+> - **部署边界与状态处理**：
+>   - Job Worker 正在执行的任务不可通过 `SIGINT` 中途取消，阶梯超时不构成任务完全 drain；超时强杀后遗留在 SQLite 中处于 `running` 状态的任务在重启后按既有机制置为 `failed`（错误码 `restart`）不自动重放。
+>   - 子进程中派生独立 `setsid` 的后代进程无法被 `killpg` 组信号覆盖，需依赖容器环境在真实的 PID 1 退出时由 Linux 内核统一清理 PID namespace。部署 Pod 时建议设置 `terminationGracePeriodSeconds: 30`，并确保保持 `hostPID: false` 与 `shareProcessNamespace: false`。
+
 ---
 
 ## 4. OpenCode V2 插件注册与配置
@@ -265,12 +289,20 @@ PYTHONPATH="$BRIDGE_REPO/companion:$HERMES_REPO${PYTHONPATH:+:$PYTHONPATH}" \
 
 1. **Companion 并非执行沙箱**：Companion 的路径检查（限制在 `uploads/` 与 `output/` 目录）仅用于 HTTP 文件交换的边界防护，**不构成 Hermes Agent 的系统权限沙箱**。Hermes 运行时依然拥有宿主所赋予的环境与工具权限。
 2. **凭据脱敏与处理边界**：Companion 对自身模型与工具执行的异常信息进行了脱敏处理，防止底层提供商的 API Key 或敏感环境变量随错误报文泄露至网络。Bridge 本身不主动持久化或记录显式路由的模型 API Key，但当 Key 透传给 `AIAgent` 后，Hermes、工具或第三方 SDK 的内部行为不受 Bridge 约束，相关执行环境安全须由部署者配置限制。
-3. **网络暴露与访问控制**：服务默认绑定 `127.0.0.1`，鉴权仅通过 Bearer Token 进行。若需在受信任的局域网（LAN）内使用 HTTP 访问，必须实施受信网络访问控制（如内网防火墙源地址白名单、严禁直接暴露于公网）。需要注意：局域网明文 HTTP 传输并不等同于 TLS，亦非绝对安全（Bearer Token 与通信内容在网络链路上仍以明文传输）；在跨公网或不可信网络链路中，强烈建议前置 TLS 反向代理或使用 VPN / 加密隧道。本项目不提供公网开放端点配置指南。
+3. **网络暴露与访问控制**：服务默认绑定 `127.0.0.1`，鉴权仅通过 Bearer Token 进行。若需在受信任局域网（LAN）内提供访问，建议限制仅允许特定授权网段（公开范例可参考双网段 `192.168.1.0/24` 与 `192.168.10.0/24`），配合容器 NetworkPolicy 与宿主机 ACL 两层约束；上游 SNAT 可能掩盖真实来源，须核实服务器实际观察到的源地址，严禁直接暴露于公网。需要注意：局域网明文 HTTP 传输并不等同于 TLS，亦非绝对安全（Bearer Token 与通信内容在网络链路上仍以明文传输）；在跨公网或不可信网络链路中，强烈建议前置 TLS 反向代理或使用 VPN / 加密隧道。本项目不提供公网开放端点配置指南。
 
 ---
 
 ## 9. 验证现状简述
 
-项目已完成单元测试、跨语言集成测试及最小化实体联调（完整证据与分层矩阵详见 [docs/VERIFICATION.md](docs/VERIFICATION.md)）：
-- **已证实**：TypeScript 产物构建与类型检查（未变更）、TypeScript 单元测试（21 项 / 145 断言）；Python 服务端测试（25 项，覆盖服务接口、调度队列、错误脱敏，以及新增的显式路由参数捕获、合法性校验、Fail-Fast 拦截与指定测试场景下的凭据扫描）；跨语言 HTTP 集成测试（3 场景 / 105 断言，依托 EchoRunner 回显桩验证字节流通）；真实 OpenCode 宿主（`2.0.24+de2cacd`）成功加载 `dist/` 并注册可用工具；在隔离环境中通过真实 Hermes（`0.21.5`）完成 1 次真实模型文本调用（返回 200 与固定回复），且测试夹具文件字节双向传输 SHA-256 完全匹配。
-- **未证实 / 未运行**：测试文件输出由夹具生成而非模型创建；图像请求在发送前被 Hermes 移除，因此模型视觉理解能力未验证；真实宿主内的模型自主工具选择、权限确认弹窗及后台自动回投全链路 UI 尚未运行测试；新增的显式模型路由能力仅完成 Python 单元测试覆盖，尚未在真实自定义模型网关或新生产环境中进行实机部署验证，不代表任意模型路由一定兼容。测试已清理全部自建资源，未改动现有生产服务。
+项目已完成单元测试、跨语言集成测试、同镜像容器生命周期验收、生产环境 GitOps 部署运行时验收及显式路由真实模型实测（完整证据与分层矩阵详见 [docs/VERIFICATION.md](docs/VERIFICATION.md)）：
+- **离线与端到端自动化测试**：TypeScript 构建/类型检查与 21 项客户端单测（145 断言）未变；跨语言集成测试（3 场景 / 105 断言）通过 EchoRunner 验证真实字节流通；Python 离线测试 37 项全部通过（耗时 4.021s 无 skip，含 25 项服务与路由配置单测，以及 12 项基于 `PR_SET_CHILD_SUBREAPER` 与内部缩时参数的 PID 1 生命周期仿真单测）。
+- **同镜像真实容器 PID 1 验收（PASS）**：在隔离 Pod 中使用固定镜像（Hermes 0.21.5 / Python 3.13.5，UID/GID 10000、CapEff 0、NoNewPrivs 1、Seccomp 2）实测源码（commit `ce8cb6445d9f64d9d2af1d6419f46de6ad97495d`）。确认真实 PID 1 与独立子进程启动（非 PID 1 拒绝）；环回 401/404 探测未导入 `run_agent`/`AIAgent` 且未调用模型接口（全程 0 POST）；6 项 Supervisor 契约在真实 PID 1 下全数通过且最终 `waitpid` 报 `ECHILD`（含生产级 20s/25s/27s 阶梯超时强杀实测证据）；SIGTERM 与 Pod 删除均平滑以 exitCode 0 退出（单次观测 2.007s / 1.428s，不作固定 SLA 上限承诺）；测试命名空间与自建对象已完整清理。
+- **生产环境 GitOps 部署与运行时安全验收（PASS）**：生产环境通过 GitOps 修补上线（GitOps commit `6a3d295b0514a6d2124cd15ed3807440f12cd768`），源码保持 `ce8cb6445d9f64d9d2af1d6419f46de6ad97495d` 未变（ConfigMap 六源文件哈希一致，镜像固定 digest `sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7`）。34 项 ACL + 25 项运行时 + 10 项附加门禁全数通过；新 Pod Ready 1/1，restart 0；保持 `fsGroup: 10000`，由 init 容器通过固定目录 fd 校验并收紧卷根目录 `/bridge/state`，三个子目录沿用各自初始化检查（此前卷根目录实测 02770，修补后为 0700；四者实测均 `10000:10000` / `0700`）；三次固定鉴权探测（匿名 401、错误 Token 401、正确 Token 查询未知 Job 404）均通过。
+- **显式模型路由真实模型短文本调用（PASS）**：2026-10-11 实机调用。在生产部署上通过显式配置（`provider: custom`、`api_mode: chat_completions`、网关 Aether、模型 `z-ai/glm-5.3-flash`）成功完成 1 次独立短文本任务并返回 `HERMES_BRIDGE_OK`。全流程记录 1 次 POST 提交与 16 次同 ID GET 轮询，总耗时 30.741s，附件为空，无错误返回。
+- **历史宿主与隔离实体联调**：真实 OpenCode 宿主（`2.0.24+de2cacd`）加载激活与工具枚举通过；历史隔离测试中真实 Hermes 0.21.5 默认配置完成 1 次纯文本调用（HTTP 200）及夹具文件双向运输 SHA-256 匹配。
+- **未证实 / 未运行边界（NOT PROVEN / NOT RUN）**：
+  - 生产发布上线与局域网实机流转状态明确分开：真实入站客户端源地址身份在探测记录中未关联外部网络五元组（**NOTPROVEN**）；第二授权网段（示例 `192.168.10.0/24`）跨网段真实数据流转未执行实机测试（**NOTRUN**，规则检查不可替代双 LAN 实测）；
+  - 单任务不构成 SDK 调用承诺或通用模型兼容：单次短文本任务成功不保证底层 SDK 内部仅发起单次 HTTP 推理请求，亦不声称对任意第三方网关或任意模型均兼容；
+  - 宿主全链路 UI 回投未运行（**NOTRUN**）：宿主交互式会话中的模型自主工具调用、权限确认弹窗及后台自动回投至真实聊天窗口未运行测试（插件端到端连接及宿主交互验证尚未完成）；
+  - 多媒体与视觉限制：测试夹具文件由程序生成而非模型自主创建；图像发送前被 Hermes 移除，模型视觉理解未验证（**INCONCLUSIVE**）；UI 与视觉均维持原有限制。

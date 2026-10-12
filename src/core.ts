@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { Config } from './config.js'
 import { saveOutputs, snapshot, type PromptFile, type SavedOutputs } from './files.js'
 import { attachments, LIMITS, readJSON, record, response, text, uuid, type JobRequest, type JobResponse } from './protocol.js'
@@ -20,6 +20,7 @@ export interface Dependencies {
 export type Status = 'accepted' | JobResponse['status'] | 'paused'
 export interface OutboxJob extends JobRequest {
   sessionID: string; status: Status; submitted: boolean; delivered: boolean
+  postAttempted: boolean; scopeHash?: string
   createdAt: number; deadline: number; nextAt: number; attempts: number; generation: number
   result?: JobResponse; notice?: string
 }
@@ -31,6 +32,11 @@ export interface JobView {
 const systemClock: Clock = {
   now: () => Date.now(),
   schedule: (callback, delay) => { const timer = setTimeout(callback, delay); timer.unref?.(); return () => clearTimeout(timer) },
+}
+const unknownNotice = 'Outcome unknown: Companion HTTP 404 does not prove this job was never executed. Waiting is paused. hermes_resume only queries the original record; it will not resubmit the request.'
+function outboundScope(config: Config): string {
+  const credentialHash = createHash('sha256').update(config.token).digest('hex')
+  return createHash('sha256').update(JSON.stringify([config.url, credentialHash])).digest('hex')
 }
 function loadState(raw: string | undefined): State {
   if (raw === undefined) return { version: 1, threads: {}, jobs: {} }
@@ -47,9 +53,14 @@ function loadState(raw: string | undefined): State {
       if (typeof j[field] !== 'number' || !Number.isFinite(j[field]) || j[field] < 0) throw new Error('Invalid outbox timestamp/counter')
     }
     if (typeof j.submitted !== 'boolean' || typeof j.delivered !== 'boolean') throw new Error('Invalid outbox delivery state')
+    if (j.postAttempted !== undefined && typeof j.postAttempted !== 'boolean') throw new Error('Invalid outbox POST attempt state')
+    if (j.scopeHash !== undefined && (typeof j.scopeHash !== 'string' || !/^[a-f0-9]{64}$/.test(j.scopeHash))) throw new Error('Invalid outbox scope')
     jobs[id] = {
       id, threadId: uuid(j.threadId), sessionID: j.sessionID, text: text(j.text), attachments: attachments(j.attachments),
       status: j.status as Status, submitted: j.submitted, delivered: j.delivered,
+      // Legacy records cannot prove that a POST was never attempted. Never replay them.
+      postAttempted: j.postAttempted === undefined ? true : j.postAttempted || j.submitted,
+      ...(j.scopeHash === undefined ? {} : { scopeHash: j.scopeHash as string }),
       createdAt: j.createdAt as number, deadline: j.deadline as number, nextAt: j.nextAt as number,
       attempts: j.attempts as number, generation: j.generation as number,
       ...(j.result === undefined ? {} : { result: response(j.result, id) }),
@@ -68,6 +79,7 @@ export class Bridge {
   private state: State
   private readonly clock: Clock
   private readonly fetcher: typeof globalThis.fetch
+  private readonly scopeHash: string
   private readonly abort = new AbortController()
   private cancelTimer?: () => void
   private active?: Promise<void>
@@ -75,12 +87,34 @@ export class Bridge {
   private started = false
   private disposed = false
   private constructor(readonly config: Config, private readonly deps: Dependencies, state: State) {
+    this.config = Object.freeze({ ...config, uploadRoots: [...config.uploadRoots] })
+    this.scopeHash = outboundScope(this.config)
     this.state = state
     this.clock = deps.clock ?? systemClock
     this.fetcher = deps.fetch ?? globalThis.fetch
+    for (const j of Object.values(state.jobs)) {
+      const notice = this.scopeNotice(j)
+      if (notice && !['completed', 'failed'].includes(j.status)) this.pauseForScope(j, notice)
+    }
   }
   static async create(config: Config, deps: Dependencies): Promise<Bridge> {
-    return new Bridge(config, deps, loadState(await deps.storage.load()))
+    const raw = await deps.storage.load()
+    const bridge = new Bridge(config, deps, loadState(raw))
+    if (raw !== undefined && JSON.stringify(bridge.state) !== raw) await bridge.persist(bridge.state)
+    return bridge
+  }
+  private scopeNotice(j: OutboxJob): string | undefined {
+    if (j.scopeHash === undefined) return 'Waiting paused: this legacy job has no outbound scope binding. No HTTP request will be made, including on resume. Its prior outcome may be unknown; even an unsent legacy request requires a new explicit request to send.'
+    if (j.scopeHash !== this.scopeHash) return 'Waiting paused: the configured endpoint or credential differs from this job\'s outbound scope. No HTTP request will be made, including on resume; the job will not be rebound or resubmitted.'
+    return undefined
+  }
+  private pauseForScope(j: OutboxJob, notice: string): void {
+    if (j.status !== 'paused' || j.notice !== notice) {
+      j.delivered = false
+      j.nextAt = this.clock.now()
+    }
+    j.status = 'paused'
+    j.notice = notice
   }
   private async lock<T>(operation: () => Promise<T>): Promise<T> {
     const run = this.serial.then(operation)
@@ -104,7 +138,7 @@ export class Bridge {
       const threadId = Object.hasOwn(next.threads, sessionID) ? next.threads[sessionID]! : randomUUID()
       Object.defineProperty(next.threads, sessionID, { value: threadId, enumerable: true, writable: true, configurable: true })
       const now = this.clock.now()
-      const job: OutboxJob = { id: randomUUID(), threadId, sessionID, text: message, attachments: files, status: 'accepted', submitted: false, delivered: false, createdAt: now, deadline: now + this.config.jobTimeoutMs, nextAt: now, attempts: 0, generation: 0 }
+      const job: OutboxJob = { id: randomUUID(), threadId, sessionID, text: message, attachments: files, status: 'accepted', submitted: false, postAttempted: false, scopeHash: this.scopeHash, delivered: false, createdAt: now, deadline: now + this.config.jobTimeoutMs, nextAt: now, attempts: 0, generation: 0 }
       next.jobs[job.id] = job
       await this.persist(next)
       return this.view(job)
@@ -128,8 +162,11 @@ export class Bridge {
       const next = structuredClone(this.state)
       const j = next.jobs[uuid(id)]
       if (!j || j.sessionID !== sessionID) throw new Error('Job not found in the current session')
+      if (this.scopeNotice(j)) return this.view(j)
       if (j.status !== 'paused' && j.status !== 'failed') return this.view(j)
-      // A remotely failed job is terminal: polling it again cannot run a new task.
+      // Resume only queries the original acceptance record, even if its outcome is unknown.
+      // Conservatively close the POST gate even for a job that expired before its first send.
+      j.postAttempted = true
       j.status = j.submitted ? 'queued' : 'accepted'
       j.delivered = false
       j.attempts = 0
@@ -174,6 +211,18 @@ export class Bridge {
       await this.persist(next)
     })
   }
+  private async preparePost(j: OutboxJob): Promise<boolean> {
+    return this.lock(async () => {
+      const current = this.state.jobs[j.id]
+      if (this.disposed || !current || current.generation !== j.generation || current.postAttempted || this.scopeNotice(current)) return false
+      const next = structuredClone(this.state)
+      next.jobs[j.id]!.postAttempted = true
+      // Write ahead of HTTP. A failed save must propagate without starting any request.
+      await this.persist(next)
+      j.postAttempted = true
+      return !this.disposed && this.state.jobs[j.id]?.generation === j.generation
+    })
+  }
   private backoff(j: OutboxJob, minimum = 0): void {
     j.attempts++
     j.nextAt = this.clock.now() + Math.max(Math.min(minimum, 300_000), Math.min(60_000, this.config.pollMs * 2 ** Math.min(j.attempts, 10)))
@@ -210,12 +259,17 @@ export class Bridge {
       if (current.delivered || current.nextAt > this.clock.now()) continue
       const j = structuredClone(current)
       if (!['completed', 'failed', 'paused'].includes(j.status)) {
-        if (this.clock.now() >= j.deadline) {
+        const blocked = this.scopeNotice(j)
+        if (blocked) {
+          this.pauseForScope(j, blocked)
+        } else if (this.clock.now() >= j.deadline) {
           j.status = 'paused'
-          j.notice = 'Waiting paused after 30 minutes. Hermes may still be running. Use hermes_resume with this job ID to query/submit the same ID; no new task is created.'
+          j.notice = 'Waiting paused after the deadline. The outcome may be unknown and Hermes may still be running. hermes_resume only queries the original record; it will not resubmit the request.'
         } else {
+          const firstPost = !j.postAttempted
+          if (firstPost && !await this.preparePost(j)) continue
           try {
-            if (!j.submitted) {
+            if (firstPost) {
               const { id, threadId, text, attachments } = j
               const raw = await this.request('/v1/jobs', { id, threadId, text, attachments })
               let reply: Record<string, unknown>
@@ -227,6 +281,7 @@ export class Bridge {
               const raw = await this.request(`/v1/jobs/${j.id}`)
               let r: JobResponse
               try { r = response(raw, j.id) } catch { throw new ProtocolError('Invalid companion job response') }
+              j.submitted = true
               j.status = r.status
               if (r.status === 'completed' || r.status === 'failed') {
                 j.result = r
@@ -237,13 +292,12 @@ export class Bridge {
             j.nextAt = this.clock.now() + this.config.pollMs
           } catch (error) {
             if (this.disposed) break
-            if (error instanceof HTTPError && error.status === 404 && j.submitted) {
-              j.submitted = false // Companion lost its record; idempotency key and snapshot never change.
-              j.status = 'accepted'
-              this.backoff(j)
+            if (error instanceof HTTPError && error.status === 404) {
+              j.status = 'paused'
+              j.notice = unknownNotice
             } else if (error instanceof ProtocolError || (error instanceof HTTPError && error.status < 500 && ![408, 425, 429].includes(error.status))) {
               j.status = 'failed'
-              j.notice = error instanceof HTTPError ? `Companion HTTP ${error.status}; automatic retries stopped. Check configuration/authorization before explicitly resuming this same job.` : error.message
+              j.notice = error instanceof HTTPError ? `Companion HTTP ${error.status}; automatic retries stopped. No further POST will be made for this job. hermes_resume only queries the original record in the same outbound scope.` : error.message
             } else this.backoff(j, error instanceof HTTPError ? error.retryAfter : 0)
           }
         }

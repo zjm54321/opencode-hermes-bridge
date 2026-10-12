@@ -2,8 +2,8 @@
 
 Run: PYTHONPATH=companion python companion/tests/http_fixture.py --workspace DIR --port 0
 Requires HERMES_BRIDGE_TOKEN. Prints one JSON readiness line containing host and port.
-POST/GET use the production server/service. Every upload is copied byte-for-byte to
-the current output directory, with its original filename; response text echoes input.
+POST/GET use the production server/service. Supported input images are echoed
+inline byte-for-byte, with their original filenames; response text echoes input.
 The reserved text __fixture_fail__ raises a sanitized runner failure for integration.
 This module is deliberately excluded from the installed production package.
 """
@@ -14,26 +14,18 @@ import argparse
 import json
 import os
 from pathlib import Path
-import shutil
 
 from hermes_bridge import JobService, RunInput, RunResult
 from hermes_bridge.server import BridgeHTTPServer
 
 
 class EchoRunner:
+    scope = "test-only-inline-adapter-v1"
+
     def run(self, request: RunInput) -> RunResult:
         if request.text == "__fixture_fail__":
             raise RuntimeError("test-provider-secret-must-not-escape")
-        lines = [request.text]
-        for source in request.uploads:
-            target = request.output_dir / source.name
-            shutil.copyfile(source, target)
-            lines.append(f"MEDIA:{target}")
-        messages = request.conversation_history + [
-            {"role": "user", "content": request.text},
-            {"role": "assistant", "content": request.text},
-        ]
-        return RunResult("\n".join(lines), messages)
+        return RunResult(request.text, attachments=list(request.attachments))
 
 
 def main() -> None:

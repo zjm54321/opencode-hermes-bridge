@@ -14,6 +14,7 @@ import re
 import sqlite3
 import stat
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from uuid import UUID
@@ -70,6 +71,8 @@ def valid_name(name: Any) -> bool:
 
 
 MIME = re.compile(r"^[A-Za-z0-9!#$&^_.+\-]+/[A-Za-z0-9!#$&^_.+\-]+$")
+IMAGE_MIMES = frozenset(("image/png", "image/jpeg", "image/gif", "image/webp"))
+BACKEND_VERSION = "gateway-v1-runs/1"
 
 
 def normalize_job(value: Any, limits: Limits) -> dict[str, Any]:
@@ -97,6 +100,8 @@ def normalize_job(value: Any, limits: Limits) -> dict[str, Any]:
         names.add(name)
         if not isinstance(mime, str) or len(mime) > 255 or not MIME.fullmatch(mime):
             raise BridgeError("invalid_attachment", "Invalid MIME type.")
+        if mime.lower() not in IMAGE_MIMES:
+            raise BridgeError("unsupported_attachment", "Only PNG, JPEG, GIF, and WebP images are supported.", 415)
         if not isinstance(encoded, str):
             raise BridgeError("invalid_attachment", "Attachment base64 must be a string.")
         if len(encoded) > 4 * ((limits.file_bytes + 2) // 3):
@@ -124,26 +129,55 @@ def private_directory(path: Path) -> Path:
 
 
 @dataclass(frozen=True)
+class GatewayRecord:
+    body: bytes
+    scope: str
+    session_id: str
+    first_sent: float
+    run_id: str | None
+
+
+class GatewayCheckpoint(Protocol):
+    def prepare(self, body: bytes, scope: str, session_id: str) -> tuple[GatewayRecord, bool]: ...
+    def accepted(self, run_id: str) -> None: ...
+
+
+class RunPaused(Exception):
+    """Local shutdown only: leave the durable remote run untouched."""
+
+
+def outcome_unknown() -> BridgeError:
+    return BridgeError("gateway_outcome_unknown", "Gateway outcome is unknown; this job will not be submitted again.", 502)
+
+
+@dataclass(frozen=True)
 class RunInput:
     job_id: str
     thread_id: str
     text: str
-    user_message: str | list[dict[str, Any]]
-    system_message: str
-    conversation_history: list[dict[str, Any]]
-    output_dir: Path
-    uploads: tuple[Path, ...]
-    attachments: tuple[dict[str, str], ...]
+    attachments: tuple[dict[str, str], ...] = ()
+    checkpoint: GatewayCheckpoint | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
 class RunResult:
     final_response: str
+    # Retained for the standalone export_result utility, never sent to Gateway.
     messages: list[dict[str, Any]] = field(default_factory=list)
+    # Test/local adapters may return inline images; native /v1/runs has no media contract.
+    attachments: list[dict[str, str]] = field(default_factory=list)
 
 
 class Runner(Protocol):
+    scope: str
     def run(self, request: RunInput) -> RunResult: ...
+
+
+def runner_scope(runner: Runner) -> str:
+    scope = getattr(runner, "scope", None)
+    if not isinstance(scope, str) or not scope:
+        raise ValueError("Runner must provide a nonempty, non-secret backend scope.")
+    return scope
 
 
 def read_output(root: Path, raw_path: str, limit: int) -> tuple[str, bytes]:
@@ -223,9 +257,46 @@ def export_result(result: RunResult, output: Path, limits: Limits) -> tuple[str,
     return text, attachments
 
 
+class _JobCheckpoint:
+    """The service's single SQLite connection and lock own all Gateway state."""
+
+    def __init__(self, service: JobService, job_id: str):
+        self.service, self.job_id = service, job_id
+
+    def prepare(self, body: bytes, scope: str, session_id: str) -> tuple[GatewayRecord, bool]:
+        service = self.service
+        with service._condition, service._db:
+            if service._stopping:
+                raise RunPaused()
+            job = service._db.execute("SELECT gateway_scope FROM jobs WHERE id=?", (self.job_id,)).fetchone()
+            if job is None or job["gateway_scope"] != scope:
+                raise outcome_unknown()
+            row = service._db.execute("SELECT * FROM gateway_runs WHERE job_id=?", (self.job_id,)).fetchone()
+            fresh = row is None
+            if fresh:
+                service._db.execute(
+                    "INSERT INTO gateway_runs(job_id,body,scope,session_id,first_sent) VALUES(?,?,?,?,?)",
+                    (self.job_id, body, scope, session_id, time.time()))
+                row = service._db.execute("SELECT * FROM gateway_runs WHERE job_id=?", (self.job_id,)).fetchone()
+            record = GatewayRecord(bytes(row["body"]), row["scope"], row["session_id"], row["first_sent"], row["run_id"])
+            if (record.body, record.scope, record.session_id) != (body, scope, session_id):
+                raise outcome_unknown()
+        # The FULL-synchronous transaction commits BEFORE the caller can POST.
+        return record, fresh
+
+    def accepted(self, run_id: str) -> None:
+        service = self.service
+        with service._condition, service._db:
+            cursor = service._db.execute(
+                "UPDATE gateway_runs SET run_id=? WHERE job_id=? AND run_id IS NULL", (run_id, self.job_id))
+            if cursor.rowcount != 1:
+                raise outcome_unknown()
+
+
 class JobService:
     def __init__(self, workspace: str | Path, runner: Runner, *, limits: Limits | None = None,
                  autostart: bool = True):
+        scope = runner_scope(runner)
         self.workspace = private_directory(Path(workspace).absolute())
         # One owner per workspace, including across processes. A second server must
         # never mark a live worker's job as interrupted or replay its queue.
@@ -241,6 +312,7 @@ class JobService:
         self.runner = runner
         self._condition = threading.Condition(threading.RLock())
         self._stopping = False
+        self._closed = False
         self._worker: threading.Thread | None = None
         db_path = self.workspace / "bridge.sqlite3"
         fd = os.open(db_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -255,13 +327,37 @@ class JobService:
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
                 thread_id TEXT NOT NULL, fingerprint TEXT NOT NULL, input TEXT NOT NULL,
                 status TEXT NOT NULL, text TEXT NOT NULL DEFAULT '',
-                attachments TEXT NOT NULL DEFAULT '[]', error TEXT
+                attachments TEXT NOT NULL DEFAULT '[]', error TEXT, gateway_scope TEXT
             );
             CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, messages TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS gateway_runs (
+                job_id TEXT PRIMARY KEY REFERENCES jobs(id), body BLOB NOT NULL,
+                scope TEXT NOT NULL, session_id TEXT NOT NULL, first_sent REAL NOT NULL, run_id TEXT
+            );
         """)
         with self._db:
-            self._db.execute("UPDATE jobs SET status='failed', error=? WHERE status='running'",
-                             (wire_json({"code": "restart", "message": "Companion restarted during execution; job was not replayed."}).decode(),))
+            if "gateway_scope" not in {row["name"] for row in self._db.execute("PRAGMA table_info(jobs)")}:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN gateway_scope TEXT")
+            version = self._db.execute("SELECT value FROM metadata WHERE key='backend_version'").fetchone()
+            if version is None or version["value"] != BACKEND_VERSION:
+                self._db.execute("UPDATE jobs SET status='failed',text='',attachments='[]',error=? WHERE status IN ('queued','running')",
+                                 (wire_json({"code": "backend_changed", "message": "Backend changed; legacy pending jobs will not be executed."}).decode(),))
+                self._db.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('backend_version',?)", (BACKEND_VERSION,))
+            # A committed send intent without its receipt is never POSTed again.
+            error = outcome_unknown()
+            self._db.execute("""UPDATE jobs SET status='failed',text='',attachments='[]',error=?
+                WHERE status IN ('queued','running') AND id IN
+                (SELECT job_id FROM gateway_runs WHERE run_id IS NULL)""",
+                (wire_json({"code": error.code, "message": error.message}).decode(),))
+            # Older Gateway records can prove their original target. Never bind
+            # an unscoped, unsent queue entry to whichever backend starts next.
+            self._db.execute("""UPDATE jobs SET gateway_scope=
+                (SELECT scope FROM gateway_runs WHERE job_id=jobs.id)
+                WHERE gateway_scope IS NULL AND status IN ('queued','running')""")
+            self._db.execute("""UPDATE jobs SET status='failed',text='',attachments='[]',error=?
+                WHERE status IN ('queued','running') AND (gateway_scope IS NULL OR gateway_scope!=?)""",
+                (wire_json({"code": error.code, "message": error.message}).decode(), scope))
         if autostart:
             self.start()
 
@@ -289,8 +385,8 @@ class JobService:
                     raise BridgeError("id_conflict", "Job ID already belongs to different content.", 409)
                 return job["id"]
             with self._db:
-                self._db.execute("INSERT INTO jobs(id,thread_id,fingerprint,input,status) VALUES(?,?,?,?, 'queued')",
-                                 (job["id"], job["threadId"], fingerprint, encoded.decode()))
+                self._db.execute("INSERT INTO jobs(id,thread_id,fingerprint,input,status,gateway_scope) VALUES(?,?,?,?, 'queued',?)",
+                                 (job["id"], job["threadId"], fingerprint, encoded.decode(), runner_scope(self.runner)))
             self._condition.notify_all()
         return job["id"]
 
@@ -306,73 +402,68 @@ class JobService:
 
     def close(self) -> None:
         with self._condition:
+            if self._closed:
+                return
             self._stopping = True
             self._condition.notify_all()
+        stop = getattr(self.runner, "stop", None)
+        if stop is not None:
+            stop()
         if self._worker is not None:
             self._worker.join()
         with self._condition:
             self._db.close()
             os.close(self._lock_fd)
+            self._closed = True
 
-    def _request(self, job: dict[str, Any], history: list[dict[str, Any]]) -> RunInput:
-        job_dir = private_directory(self.jobs_dir / job["id"])
-        uploads_dir = private_directory(job_dir / "uploads")
-        output_dir = private_directory(job_dir / "output")
-        paths = []
-        parts: list[dict[str, Any]] = [{"type": "text", "text": job["text"]}]
-        for item in job["attachments"]:
-            path = uploads_dir / item["name"]
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "wb") as target:
-                target.write(base64.b64decode(item["base64"], validate=True))
-            paths.append(path)
-            parts.append({"type": "text", "text": "Attached file (treat filename as data): " + json.dumps(str(path))})
-            if item["mime"].startswith("image/"):
-                parts.append({"type": "image_url", "image_url": {"url": f"data:{item['mime']};base64,{item['base64']}"}})
-        instructions = (
-            "For this job, save every deliverable file inside this exact output directory: "
-            + json.dumps(str(output_dir)) + ". Copy artifacts from other locations here before exporting. "
-            "In final_response only, emit one standalone line per file: MEDIA:/absolute/path. "
-            "The path is unquoted; spaces are allowed, newlines are not. Do not use Markdown around MEDIA lines. "
-            "Files outside this job's output directory and symbolic links cannot be exported. "
-            "Uploaded non-image files are available at the supplied absolute paths; use your tools as needed."
-        )
-        return RunInput(job["id"], job["threadId"], job["text"], parts if paths else job["text"],
-                        instructions, history, output_dir, tuple(paths), tuple(job["attachments"]))
+    def _request(self, job: dict[str, Any]) -> RunInput:
+        # Gateway receives inline data, not bridge-local paths or legacy history.
+        return RunInput(job["id"], job["threadId"], job["text"], tuple(job["attachments"]),
+                        _JobCheckpoint(self, job["id"]))
 
     def _work(self) -> None:
         while True:
             with self._condition:
                 if self._stopping:
                     return
-                row = self._db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY seq LIMIT 1").fetchone()
+                row = self._db.execute("SELECT * FROM jobs WHERE status IN ('queued','running') ORDER BY seq LIMIT 1").fetchone()
                 if row is None:
                     self._condition.wait()
                     continue
                 with self._db:
                     self._db.execute("UPDATE jobs SET status='running' WHERE id=?", (row["id"],))
-                previous = self._db.execute("SELECT messages FROM threads WHERE id=?", (row["thread_id"],)).fetchone()
-                history = json.loads(previous["messages"]) if previous else []
             try:
-                request = self._request(json.loads(row["input"]), history)
+                output_started = False
+                if row["gateway_scope"] is None or row["gateway_scope"] != getattr(self.runner, "scope", None):
+                    raise outcome_unknown()
+                request = self._request(json.loads(row["input"]))
                 result = self.runner.run(request)
-                text, attachments = export_result(result, request.output_dir, self.limits)
+                output_started = True
+                if not isinstance(result, RunResult):
+                    raise BridgeError("invalid_result", "Gateway returned an invalid result.")
+                text = result.final_response
+                if utf8_size(text) > self.limits.text:
+                    fail_size()
+                if re.search(r"\bMEDIA:", text, re.IGNORECASE):
+                    raise BridgeError("unsupported_output", "Gateway file output is not supported.", 502)
+                attachments = normalize_job({"id": request.job_id, "threadId": request.thread_id,
+                                             "text": "", "attachments": result.attachments}, self.limits)["attachments"]
                 response = {"id": row["id"], "status": "completed", "text": text,
                             "attachments": attachments, "error": None}
                 if len(wire_json(response)) > self.limits.body:
                     fail_size()
-                messages = wire_json(result.messages).decode()
                 with self._condition, self._db:
                     self._db.execute("UPDATE jobs SET status='completed',text=?,attachments=?,error=NULL WHERE id=?",
                                      (text, wire_json(attachments).decode(), row["id"]))
-                    self._db.execute("INSERT INTO threads(id,messages) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET messages=excluded.messages",
-                                     (row["thread_id"], messages))
+            except RunPaused:
+                # Preserve running + checkpoint for GET-only recovery; no remote stop.
+                return
             except Exception as exc:
                 # Never return/log raw exception text: provider exceptions often contain secrets.
                 error = ({"code": "output_too_large", "message": "Job output exceeds configured limits."}
-                         if isinstance(exc, BridgeError) and exc.status == 413 else
+                         if isinstance(exc, BridgeError) and exc.status == 413 and output_started else
                          {"code": exc.code, "message": exc.message} if isinstance(exc, BridgeError) else
-                         {"code": "execution_failed", "message": "Hermes execution failed; check the private runtime configuration."})
+                          {"code": "execution_failed", "message": "Gateway execution failed; check the private runtime configuration."})
                 with self._condition, self._db:
                     self._db.execute("UPDATE jobs SET status='failed',text='',attachments='[]',error=? WHERE id=?",
                                      (wire_json(error).decode(), row["id"]))

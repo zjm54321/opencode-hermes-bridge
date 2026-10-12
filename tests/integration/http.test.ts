@@ -7,19 +7,23 @@ import { MemoryStorage, withFixture } from './harness.js'
 
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex')
 
-test('real HTTP: durable byte snapshots, restart/repeated-ID idempotency, private artifact hashes and session isolation', async () => {
+test('fixture inline echo over HTTP (no model): snapshots, idempotency, private files and session isolation', async () => {
   await withFixture(async h => {
-    const files = await h.files()
-    const [png, txt, pdf, zip] = files
+    const [png, txt, pdf, zip] = await h.files()
     if (!png || !txt || !pdf || !zip) throw new Error('Missing generated fixtures')
+    const pathImage = { ...png, name: 'path-image.png' }
+    const base64Image = { ...png, name: 'base64-image.png' }
+    const files = [png, pathImage, base64Image]
     const original = await h.bridge()
+    for (const file of [txt, pdf, zip]) {
+      await expect(original.ask('integration-session-a', { text: 'Unsupported ordinary file', attachments: [file] })).rejects.toThrow('ordinary file attachments are not supported')
+    }
     const job = await original.ask('integration-session-a', {
       text: 'Echo these exact fixture bytes; this is not a model-understanding test.',
       attachments: [
         { name: png.name, data: `data:${png.mime};base64,${png.base64}` },
-        { name: txt.name, mime: txt.mime, path: join(h.uploads, txt.name) },
-        { name: pdf.name, mime: pdf.mime, base64: pdf.base64 },
-        { name: zip.name, data: `data:${zip.mime};base64,${zip.base64}` },
+        { name: pathImage.name, mime: pathImage.mime, path: join(h.uploads, png.name) },
+        { name: base64Image.name, mime: base64Image.mime, base64: base64Image.base64 },
       ],
     })
     // No consumer has run: inspect the actual server DB, not a mocked fetch counter.
@@ -32,26 +36,34 @@ test('real HTTP: durable byte snapshots, restart/repeated-ID idempotency, privat
       expect(h.storage.job(job.id).attachments.find(a => a.name === file.name)?.base64).toBe(file.base64)
     }
     // Mutating the allowed source after local acceptance must not change durable bytes.
-    await writeFile(join(h.uploads, txt.name), 'Changed AFTER the accepted snapshot.')
+    await writeFile(join(h.uploads, png.name), 'Changed AFTER the accepted snapshot.')
     await original.dispose()
     const { id, threadId, text, attachments } = h.storage.job(job.id)
     const request: JobRequest = { id, threadId, text, attachments }
 
     // Simulate a companion accepting a submission whose ACK the old client did not persist.
+    // The client must have persisted its irreversible attempt marker before that HTTP send.
+    const pending = JSON.parse(h.storage.value!) as { jobs: Record<string, { postAttempted: boolean }> }
+    pending.jobs[id]!.postAttempted = true
+    await h.storage.save(JSON.stringify(pending))
     const firstPost = await h.http('/v1/jobs', request)
     expect(firstPost.status).toBe(202)
     expect(await firstPost.json()).toEqual({ id })
     const remote = await h.terminal(id)
     expect(remote.status).toBe('completed')
-    expect(remote.attachments).toHaveLength(4)
-    const originalTimes = new Map<string, bigint>()
+    // EchoRunner returns inline attachments for this fixture only. This does not prove
+    // the native Hermes API Gateway returns attachments or creates server-side files.
+    expect(remote.attachments).toHaveLength(3)
+    const initialEvidence = await h.evidence(id, threadId)
+    expect(initialEvidence.rows).toHaveLength(1)
+    const persistedInput = JSON.parse(initialEvidence.rows[0]!.input) as JobRequest
+    expect(persistedInput).toEqual(request)
     for (const file of files) {
-      const uploaded = join(h.workspace, 'jobs', id, 'uploads', file.name)
-      const output = join(h.workspace, 'jobs', id, 'output', file.name)
-      expect(sha256(await readFile(uploaded))).toBe(file.sha256)
-      expect(sha256(await readFile(output))).toBe(file.sha256)
-      expect(remote.attachments.find(a => a.name === file.name)?.base64).toBe(file.base64)
-      originalTimes.set(file.name, (await stat(output, { bigint: true })).mtimeNs)
+      const inputAttachment = persistedInput.attachments.find(a => a.name === file.name)!
+      const outputAttachment = remote.attachments.find(a => a.name === file.name)!
+      expect(sha256(Buffer.from(inputAttachment.base64, 'base64'))).toBe(file.sha256)
+      expect(sha256(Buffer.from(outputAttachment.base64, 'base64'))).toBe(file.sha256)
+      expect(outputAttachment.base64).toBe(file.base64)
     }
     const duplicate = await h.http('/v1/jobs', request)
     expect(duplicate.status).toBe(202)
@@ -59,8 +71,11 @@ test('real HTTP: durable byte snapshots, restart/repeated-ID idempotency, privat
     const conflict = await h.http('/v1/jobs', { ...request, text: 'Different content under the same ID' })
     expect(conflict.status).toBe(409)
     expect(await conflict.text()).not.toContain(h.token)
+    // Neither an identical replay nor a conflicting body may overwrite the stored job/result.
+    expect((await h.evidence(id, threadId)).rows).toEqual(initialEvidence.rows)
+    expect(await h.terminal(id)).toEqual(remote)
 
-    // New Bridge instance, same durable local outbox still says "accepted".
+    // New Bridge instance: local ACK is missing, but the durable attempt marker permits only GET.
     expect(h.storage.job(id).submitted).toBe(false)
     const restarted = await h.bridge()
     const other = await restarted.ask('integration-session-b', { text: 'Independent second session' })
@@ -73,15 +88,15 @@ test('real HTTP: durable byte snapshots, restart/repeated-ID idempotency, privat
     const evidence = await h.evidence(id, threadId)
     expect(evidence.rows).toHaveLength(1)
     expect(evidence.rows[0]?.status).toBe('completed')
-    expect(evidence.messages).toHaveLength(2) // One user/assistant pair, not replayed twice.
-    expect(evidence.messages[0]?.content).toBe(text)
+    // The bridge must not generate or reinject its former independent conversation history.
+    expect(evidence.messages).toEqual([])
     expect((JSON.parse(evidence.rows[0]!.input) as JobRequest).attachments).toEqual(attachments)
+    const originalTimes = new Map<string, bigint>()
     for (const file of files) {
-      const serverOutput = join(h.workspace, 'jobs', id, 'output', file.name)
       const clientOutput = join(h.outputs, id, file.name)
-      expect((await stat(serverOutput, { bigint: true })).mtimeNs).toBe(originalTimes.get(file.name)!)
       expect(sha256(await readFile(clientOutput))).toBe(file.sha256)
       expect((await stat(clientOutput)).mode & 0o777).toBe(0o600)
+      originalTimes.set(file.name, (await stat(clientOutput, { bigint: true })).mtimeNs)
     }
     expect((await stat(join(h.outputs, id))).mode & 0o777).toBe(0o700)
     const a = h.prompts.filter(p => p.sessionID === 'integration-session-a')
@@ -93,18 +108,24 @@ test('real HTTP: durable byte snapshots, restart/repeated-ID idempotency, privat
     expect(a[0]?.text).not.toContain(other.id)
     expect(b[0]?.text).toContain(other.id)
     expect(b[0]?.text).not.toContain(id)
-    expect(a[0]?.files.map(f => f.name).sort()).toEqual([png.name, txt.name].sort())
-    expect(a[0]?.files.find(f => f.name === png.name)?.uri).toBe(`data:${png.mime};base64,${png.base64}`)
-    expect(a[0]?.files.find(f => f.name === txt.name)?.uri).toBe(`data:${txt.mime};base64,${txt.base64}`)
-    for (const file of [pdf, zip]) {
-      expect(a[0]?.files.some(f => f.name === file.name)).toBe(false)
+    expect(a[0]?.files.map(f => f.name).sort()).toEqual(files.map(f => f.name).sort())
+    for (const file of files) {
+      expect(a[0]?.files.find(f => f.name === file.name)?.uri).toBe(`data:${file.mime};base64,${file.base64}`)
       expect(a[0]?.text).toContain(join(h.outputs, id, file.name))
     }
     expect(a[0]?.text).toContain('binary contents have NOT been read')
     await expect(restarted.status('integration-session-b', id)).rejects.toThrow('current session')
     await expect(restarted.resume('integration-session-b', id)).rejects.toThrow('current session')
     await restarted.tick()
+    await restarted.dispose()
+    const deliveredRestart = await h.bridge()
+    await deliveredRestart.tick()
     expect(h.prompts).toHaveLength(2)
+    for (const file of files) {
+      const clientOutput = join(h.outputs, id, file.name)
+      expect((await stat(clientOutput, { bigint: true })).mtimeNs).toBe(originalTimes.get(file.name)!)
+      expect(sha256(await readFile(clientOutput))).toBe(file.sha256)
+    }
   })
 }, 30_000)
 
@@ -162,7 +183,7 @@ test('real HTTP worker: execution failure is sanitized and delivered; a later sa
     const evidence = await h.evidence(succeeding.id, succeeding.threadId)
     expect(evidence.rows).toHaveLength(1)
     expect(evidence.rows[0]?.status).toBe('completed')
-    expect(evidence.messages).toHaveLength(2)
+    expect(evidence.messages).toEqual([]) // No legacy bridge-managed conversation history.
     await bridge.tick()
     expect(h.prompts).toHaveLength(2)
     expect(h.storage.value).not.toContain(h.token)

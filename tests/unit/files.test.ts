@@ -14,19 +14,19 @@ describe('attachment boundaries', () => {
     const dir = await temp()
     const root = join(dir, 'root')
     await mkdir(root)
-    const path = join(root, 'bytes.dat')
+    const path = join(root, 'bytes.png')
     const bytes = Buffer.from([0, 255, 128, 13, 10])
     await writeFile(path, bytes)
-    const input = [{ path, mime: 'application/octet-stream' }]
+    const input = [{ path, mime: 'image/png' }]
     await expect(snapshot(input, cfg())).rejects.toThrow('uploads disabled')
     const configured = { ...cfg(), uploadRoots: [root] }
     const result = await snapshot(input, configured)
     expect(Buffer.from(result[0]!.base64, 'base64')).toEqual(bytes)
     await writeFile(path, 'changed')
     expect(Buffer.from(result[0]!.base64, 'base64')).toEqual(bytes)
-    await expect(snapshot([{ path: join(dir, 'root-evil/a'), mime: 'text/plain' }], configured)).rejects.toThrow('outside')
-    await expect(snapshot([{ path: 'https://example.org/a', mime: 'text/plain' }], configured)).rejects.toThrow('remote')
-    await expect(snapshot([{ path: `${root}/../root/bytes.dat`, mime: 'text/plain' }], configured)).rejects.toThrow('Unsafe')
+    await expect(snapshot([{ path: join(dir, 'root-evil/a'), mime: 'image/png' }], configured)).rejects.toThrow('outside')
+    await expect(snapshot([{ path: 'https://example.org/a', mime: 'image/png' }], configured)).rejects.toThrow('remote')
+    await expect(snapshot([{ path: `${root}/../root/bytes.png`, mime: 'image/png' }], configured)).rejects.toThrow('Unsafe')
   })
 
   test('rejects final, ancestor and configured-root symlinks plus nonregular files', async () => {
@@ -39,25 +39,25 @@ describe('attachment boundaries', () => {
     await symlink(root, join(dir, 'linked-root'))
     const configured = { ...cfg(), uploadRoots: [dir] }
     for (const path of [join(root, 'linked'), join(dir, 'linked-root/ok')]) {
-      await expect(snapshot([{ path, mime: 'text/plain' }], configured)).rejects.toThrow('Symbolic')
+      await expect(snapshot([{ path, mime: 'image/png' }], configured)).rejects.toThrow('Symbolic')
     }
-    await expect(snapshot([{ path: join(dir, 'linked-root/ok'), mime: 'text/plain' }], { ...cfg(), uploadRoots: [join(dir, 'linked-root')] })).rejects.toThrow('Symbolic')
-    await expect(snapshot([{ path: root, mime: 'text/plain' }], configured)).rejects.toThrow('regular file')
+    await expect(snapshot([{ path: join(dir, 'linked-root/ok'), mime: 'image/png' }], { ...cfg(), uploadRoots: [join(dir, 'linked-root')] })).rejects.toThrow('Symbolic')
+    await expect(snapshot([{ path: root, mime: 'image/png' }], configured)).rejects.toThrow('regular file')
   })
 
   test('validates names, canonical base64, MIME and data URL lengths before decoding', async () => {
     for (const name of ['../x', '/x', 'a/b', 'a\\b', '..', '.', 'a\0b', 'C:evil']) {
-      await expect(snapshot([{ name, mime: 'text/plain', base64: 'YQ==' }], cfg())).rejects.toThrow('basename')
+      await expect(snapshot([{ name, mime: 'image/png', base64: 'YQ==' }], cfg())).rejects.toThrow('basename')
     }
     for (const base64 of ['a', '!!!!', 'YQ=', 'YQ==\n', 'YR==', '=YQ=']) {
-      await expect(snapshot([{ name: 'a', mime: 'text/plain', base64 }], cfg())).rejects.toThrow('base64')
+      await expect(snapshot([{ name: 'a', mime: 'image/png', base64 }], cfg())).rejects.toThrow('base64')
     }
     await expect(snapshot([{ name: 'a', mime: 'text/plain; charset=utf8', base64: '' }], cfg())).rejects.toThrow('MIME')
     await expect(snapshot([{ name: 'a', data: 'data:text/plain;base64,YQ==', mime: 'image/png' }], cfg())).rejects.toThrow('mismatch')
     await expect(snapshot([{ name: 'a', data: `data:text/plain;base64,${'A'.repeat(Math.ceil(LIMITS.file / 3) * 4 + 300)}` }], cfg())).rejects.toThrow('too large')
-    expect(await snapshot([{ name: 'a', data: 'data:text/plain;base64,YQ==' }], cfg())).toEqual([{ name: 'a', mime: 'text/plain', base64: 'YQ==' }])
-    await expect(snapshot([{ name: 'a', mime: 'text/plain', base64: '' }, { name: 'a', mime: 'text/plain', base64: '' }], cfg())).rejects.toThrow('Duplicate')
-    await expect(snapshot(Array.from({ length: 9 }, (_, i) => ({ name: String(i), mime: 'text/plain', base64: '' })), cfg())).rejects.toThrow('8 attachments')
+    expect(await snapshot([{ name: 'a', data: 'data:image/png;base64,YQ==' }], cfg())).toEqual([{ name: 'a', mime: 'image/png', base64: 'YQ==' }])
+    await expect(snapshot([{ name: 'a', mime: 'image/png', base64: '' }, { name: 'a', mime: 'image/png', base64: '' }], cfg())).rejects.toThrow('Duplicate')
+    await expect(snapshot(Array.from({ length: 9 }, (_, i) => ({ name: String(i), mime: 'image/png', base64: '' })), cfg())).rejects.toThrow('8 attachments')
   })
 
   test('enforces per-file and aggregate decoded limits including disk uploads', async () => {
@@ -65,9 +65,30 @@ describe('attachment boundaries', () => {
     const file = join(dir, 'large')
     await writeFile(file, '')
     await truncate(file, LIMITS.file + 1)
-    await expect(snapshot([{ path: file, mime: 'application/octet-stream' }], { ...cfg(), uploadRoots: [dir] })).rejects.toThrow('10 MiB')
+    await expect(snapshot([{ path: file, mime: 'image/png' }], { ...cfg(), uploadRoots: [dir] })).rejects.toThrow('10 MiB')
     const large = Buffer.alloc(LIMITS.file).toString('base64')
-    await expect(snapshot([{ name: 'a', mime: 'application/octet-stream', base64: large }, { name: 'b', mime: 'application/octet-stream', base64: large }, { name: 'c', mime: 'text/plain', base64: 'YQ==' }], cfg())).rejects.toThrow('20 MiB')
+    await expect(snapshot([{ name: 'a', mime: 'image/png', base64: large }, { name: 'b', mime: 'image/png', base64: large }, { name: 'c', mime: 'image/png', base64: 'YQ==' }], cfg())).rejects.toThrow('20 MiB')
+  })
+
+  test('only four image MIME types enter new jobs; ordinary files are rejected before reading or queueing', async () => {
+    for (const mime of ['image/png', 'image/jpeg', 'image/gif', 'image/webp']) {
+      expect(await snapshot([{ name: 'image', mime, base64: 'YQ==' }], cfg())).toEqual([{ name: 'image', mime, base64: 'YQ==' }])
+    }
+    const storage = new MemoryStorage()
+    const bridge = await Bridge.create(cfg(), { storage, prompt: async () => {} })
+    for (const mime of ['text/plain', 'application/pdf', 'application/zip', 'application/octet-stream', 'image/svg+xml']) {
+      for (const attachment of [
+        // This missing/disallowed path would fail differently if readUpload ran first.
+        { path: '/does-not-exist/ordinary-file', mime },
+        { name: 'ordinary-file', mime, base64: 'YQ==' },
+        { name: 'ordinary-file', data: `data:${mime};base64,YQ==` },
+      ]) {
+        await expect(bridge.ask('s', { text: 'do not send as text', attachments: [attachment] })).rejects.toThrow('ordinary file attachments are not supported')
+      }
+    }
+    expect(storage.value).toBeUndefined()
+    expect(await bridge.status('s')).toEqual([])
+    await bridge.dispose()
   })
 
   test('PNG/text enter V2 prompt files, PDF/ZIP remain byte-perfect private artifacts with explicit path notice', async () => {

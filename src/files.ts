@@ -63,7 +63,12 @@ async function readUpload(raw: string, cfg: Config, signal?: AbortSignal): Promi
     return Buffer.concat(chunks)
   } finally { await handle.close() }
 }
-/** Inputs: {name,mime,base64}, {name?,mime?,data}, or {name?,mime,path}. */
+function imageMime(value: unknown): string {
+  const type = mime(value)
+  if (!['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(type)) throw new Error('Only PNG, JPEG, GIF and WebP images are supported; ordinary file attachments are not supported')
+  return type
+}
+/** Image inputs: {name,mime,base64}, {name?,mime?,data}, or {name?,mime,path}. */
 export async function snapshot(value: unknown, cfg: Config, signal?: AbortSignal): Promise<Attachment[]> {
   if (!Array.isArray(value) || value.length > LIMITS.count) throw new Error('At most 8 attachments allowed')
   const result: Attachment[] = []
@@ -78,7 +83,7 @@ export async function snapshot(value: unknown, cfg: Config, signal?: AbortSignal
     if ('path' in a) {
       if (typeof a.path !== 'string') throw new Error('Invalid upload path')
       filename = name(a.name ?? basename(a.path))
-      type = mime(a.mime)
+      type = imageMime(a.mime)
       bytes = await readUpload(a.path, cfg, signal)
     } else if ('data' in a) {
       if (typeof a.data !== 'string' || a.data.length > Math.ceil(LIMITS.file / 3) * 4 + 256) throw new Error('Data URL too large')
@@ -86,11 +91,12 @@ export async function snapshot(value: unknown, cfg: Config, signal?: AbortSignal
       if (!match) throw new Error('Expected a base64 data URL')
       type = mime(match[1])
       if (a.mime !== undefined && mime(a.mime) !== type) throw new Error('Data URL MIME mismatch')
+      type = imageMime(type)
       filename = name(a.name)
       bytes = decode(match[2])
     } else {
       filename = name(a.name)
-      type = mime(a.mime)
+      type = imageMime(a.mime)
       bytes = decode(a.base64)
     }
     total += bytes.length

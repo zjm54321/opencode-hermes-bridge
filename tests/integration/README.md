@@ -12,12 +12,13 @@ injects **EchoRunner**, not Hermes or a real model. Prompt delivery is collected
 the V2-shaped callback boundary: this is **not** evidence of real Hermes attachment
 understanding or automatic delivery/rendering in a running OpenCode host UI.
 
-Three bounded scenarios cover byte-preserving PNG/text/PDF/ZIP transfer and private
-output hashes, data URLs and explicit upload roots, local acceptance before HTTP,
-outbox restart with an unrecorded acknowledgement, repeated-ID 202 versus conflict
-409, session isolation, sanitized 401, and recovery after executor failure.
+Three bounded scenarios cover:
+1. Input rejection of ordinary files (TXT/PDF/ZIP rejected before HTTP submission), byte-preserving PNG transfer across three input shapes (data URLs, explicit upload roots, and raw base64) with private output hashes (0600 file / 0700 dir), local acceptance before HTTP, outbox restart with an unrecorded acknowledgement (preventing POST replay via postAttempted), server idempotency via manual duplicate POST (202 without rerun) versus conflict 409, session isolation, and verification that bridge conversation history remains empty.
+2. Sanitized HTTP 401 authentication rejection: creates no server job, halts automatic retry, and notifies the session once.
+3. Sanitized worker execution failure: error is delivered, while a subsequent request on the same thread succeeds cleanly with empty legacy history.
+
 Read-only SQLite job/history queries plus unchanged artifact mtimes provide basic
-evidence that repeated submissions did not rerun the executor. They do not prove
+evidence that manual duplicate submissions did not rerun the executor. They do not prove
 exactly-once prompt delivery; the documented queue/persist crash window remains.
 
 Every invocation creates an isolated directory under `/tmp/opencode`, a random

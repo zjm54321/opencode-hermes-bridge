@@ -1,4 +1,4 @@
-"""Authenticated HTTP boundary; production CLI always uses the actual Hermes runner."""
+"""Authenticated jobs boundary; production forwards only to the native Gateway."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import socket
 from typing import Any
 
 from .core import BridgeError, JobService, private_directory, wire_json
-from .runner import HermesRunner
+from .runner import GatewayRunner
 
 
 def reject_constant(_: str) -> None:
@@ -137,23 +137,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Authenticated Hermes companion; remote HTTP requires trusted-network access controls, and untrusted networks should use TLS. Set HERMES_HOME in the process environment before launch; do not switch profiles at runtime.")
+    parser = argparse.ArgumentParser(description="Authenticated Hermes Gateway bridge. Set HERMES_GATEWAY_URL (base URL) and HERMES_GATEWAY_TOKEN separately from HERMES_BRIDGE_TOKEN. HTTP on trusted networks is supported; use TLS on untrusted networks.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--workspace", type=Path, default=Path.home() / ".local/share/opencode-hermes-bridge")
-    parser.add_argument("--model", default=os.environ.get("HERMES_MODEL"),
-                        help="Explicit model (defaults to process HERMES_MODEL); CLI model routing is not loaded.")
     parser.add_argument("--request-timeout", type=float, default=10)
     args = parser.parse_args()
     token = os.environ.get("HERMES_BRIDGE_TOKEN", "")
     if not token.strip():
         parser.error("HERMES_BRIDGE_TOKEN must be nonempty.")
-    if not args.model or not args.model.strip():
-        parser.error("An explicit model is required via --model or HERMES_MODEL.")
     try:
-        runner = HermesRunner(model=args.model)
+        runner = GatewayRunner()
     except ValueError:
-        parser.error("Invalid Hermes model routing configuration; check HERMES_BRIDGE_PROVIDER, HERMES_BRIDGE_BASE_URL, HERMES_BRIDGE_API_MODE, and HERMES_BRIDGE_API_KEY_ENV and its selected environment variable.")
+        parser.error("Invalid Gateway configuration; check HERMES_GATEWAY_URL and HERMES_GATEWAY_TOKEN.")
     os.umask(0o077)
     workspace = private_directory(args.workspace.absolute())
     # Exactly once, before starting threads. Never chdir per request.

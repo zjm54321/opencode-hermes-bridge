@@ -6,8 +6,8 @@ const attachmentSchema = {
   type: 'object', additionalProperties: false,
   properties: {
     name: { type: 'string', description: 'Safe unique basename. Required for base64/data inputs.' },
-    mime: { type: 'string', description: 'Lowercase MIME type without parameters; required for path/base64.' },
-    path: { type: 'string', description: 'Local file in explicitly configured uploadRoots; symlinks forbidden.' },
+    mime: { type: 'string', description: 'image/png, image/jpeg, image/gif or image/webp; required for path/base64.' },
+    path: { type: 'string', description: 'Local image in explicitly configured uploadRoots; symlinks forbidden.' },
     data: { type: 'string', description: 'data:<mime>;base64,<canonical base64>' },
     base64: { type: 'string', description: 'Canonical base64 bytes, not a URL.' },
   },
@@ -39,7 +39,7 @@ export default Plugin.define({
     const registration = await ctx.tool.transform(editor => {
       editor.add({
         name: 'hermes_ask',
-        description: 'Send a request and optional attachment bytes to the configured Hermes companion. Snapshots only explicitly allowed local uploads, persists an outbox and immediately returns LOCAL acceptance, not a Hermes/model result. Background replies go only to this OpenCode session. External data leaves this machine if the configured endpoint is remote.',
+        description: 'Send text and optional PNG/JPEG/GIF/WebP images to the configured Hermes companion; ordinary files are rejected. Snapshots only explicitly allowed local uploads, persists an outbox and immediately returns LOCAL acceptance, not a Hermes/model result. Background replies go only to this OpenCode session. External data leaves this machine if the configured endpoint is remote.',
         options: { permission: 'hermes_ask' },
         input: { type: 'object', additionalProperties: false, required: ['text'], properties: { text: { type: 'string', description: 'Request to Hermes, at most 64 KiB UTF-8.' }, attachments: { type: 'array', maxItems: 8, items: attachmentSchema } } },
         async execute(input, context) {
@@ -62,7 +62,7 @@ export default Plugin.define({
       })
       editor.add({
         name: 'hermes_resume',
-        description: 'Locally resume waiting/retry for this session’s paused or failed job, using the SAME persisted UUID and attachment snapshot. May resubmit that idempotency key; never deliberately creates a new Hermes task. Fix authorization/configuration before retrying a permanent error.',
+        description: 'Resume querying the original record for this session’s paused or failed job using its persisted UUID. Never resubmits a model request, even when the outcome is unknown. Jobs with missing or changed endpoint/credential scope stay blocked without HTTP.',
         options: { permission: 'hermes_resume' },
         input: { type: 'object', additionalProperties: false, required: ['id'], properties: { id: { type: 'string', description: 'Existing job UUID in the current session.' } } },
         async execute(input, context) {

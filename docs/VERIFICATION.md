@@ -16,12 +16,13 @@
 2. **Python Companion 服务端单元测试**：验证 HTTP 鉴权、单 Worker 串行执行、网关 scope 绑定、`gateway_runs` 账本、至多 1 次 native POST、丢失 202 标记未知、已知 run_id 指数退避恢复、旧队列隔离（`backend_changed`）、快速 stop（不发远端 cancel）与图片 MIME 校验。
 3. **跨语言端到端集成测试**：在本地真实 HTTP 协议栈下运行 TypeScript 核心客户端与 Python Companion 服务端，基于回显执行器（EchoRunner）验证多格式字节传输与生命周期完整性（注：回显 inline images 仅为测试夹具，不代表原生 Gateway 输出附件能力）。
 4. **历史架构验证基线（旧版独立 AIAgent 架构保留证据）**：保留同镜像容器 PID 1 验收、生产环境 GitOps 修补部署（commit `6a3d295`）及旧版显式路由单任务实测作为历史归属参考。
-5. **生产 Hermes Gateway 现场只读探测与身份验证**：现场实测既有 Hermes Gateway（`v2026.9.24`）、`HERMES_HOME=/opt/data`、`memory.provider=honcho`，`127.0.0.1:8642` capabilities 鉴权探测（200），Honcho 记忆只读查询，核验各入口身份映射隔离约束。
+5. **生产 Gateway 现场只读探测与 Sidecar 部署 (GitOps B)**：现场实测既有 Hermes Gateway（`v2026.9.24`）、`127.0.0.1:8642` capabilities 鉴权探测（200），以及桥接作为薄 Sidecar 挂载于原 hermes-agent Pod 内的只读验收。
+6. **真实插件端到端模型实测与身份核验**：验证真实 OpenCode 插件通过桥接向原生 Gateway 发起纯文本与内嵌 Base64 图片推理调用的全链路完成态，并核验各入口身份映射隔离约束。
 
 > **重要边界声明**：
 > - 自动化跨语言集成测试基于 `EchoRunner` 回显桩验证协议管道，回显的内联图片仅为测试夹具，**绝不等于原生 Hermes Gateway 具备输出附件回传能力**。
 > - 真实宿主加载验证证明了插件在宿主内的**加载激活、工具注册及底层闭包调用**，**不等于模型自主选择工具、权限确认 UI 弹窗交互、后台自动回投至真实聊天窗口**。
-> - 生产 Gateway 现场探测证明了原网关接口与鉴权可用，**不等于新版 Gateway 桥接服务已在生产部署或联通**；Sidecar 部署方案仅为架构建议，未在生产环境部署生效。
+> - 生产 Gateway 桥接已作为薄 Sidecar 部署（GitOps B commit `2d639d1`），直连本地回环 `127.0.0.1:8642`，保留原 `/opt/data` 及配置，未迁移或替换资料；此项验收属于服务直连与只读检查，**非双 LAN 来源实包验证**。
 > - 连接至同一 Gateway **不自动保证跨渠道共享同一 Honcho 用户记忆**，不同入口（Web PTY、微信、OpenCode）存在身份标识差异，须通过身份 Gate 正确识别，严禁擅自合并其他用户身份。
 
 ---
@@ -38,22 +39,27 @@
 | **Python 服务与网关单测** | `python -m unittest discover -s companion/tests` | 29 测试项（耗时 8.430s 无 skip） | **PASS**（全本机 fake，`test_gateway.py` 严格覆盖 Gateway 契约、断 202 标记未知、known ID 恢复、旧 queue 隔离、4 次暂时故障退避及快速 stop） |
 | **代码规范与格式检查** | `git diff --check` | 差异与空白换行规范检查 | **PASS**（无多余空白字符或换行格式异常，注：仅检查空白规范，不替代语法检查） |
 | **生产 Gateway 现场只读探测** | 生产 Pod 环回 `127.0.0.1:8642` | capabilities 探测（401/200）与 Honcho 只读查询 | **PASS**（原生 Gateway v2026.9.24 运行中，capabilities 接口响应 200，只读 Honcho 查询正常，无模型调用） |
+| **生产 Sidecar 部署与只读验收 (GitOps B)** | 生产 hermes-agent Pod（commit `2d639d199bac5eb011efa5ac41cd705c08346c2f`） | 薄 Sidecar 直连 `127.0.0.1:8642` / Flux / 网络 / 安全 / 只读鉴权 | **PASS**（桥接作为 Sidecar 运行，直连原生 Gateway，保留原 /opt/data 及配置；非双 LAN 实包验证） |
+| **真实插件端到端模型实测 (当前 Gateway 链路)** | 真实 OpenCode 插件 + 原生 Gateway | 纯文本返回 `HERMES_GATEWAY_OK`；32×32 纯蓝 PNG（内嵌 Base64）返回蓝色 | **PASS**（两任务均对应原生 `run_<32hex>`，同 `session_id`，GET 200 completed=true，输出完全匹配） |
 | **[历史架构] 容器 PID 1 验收** | 隔离 Pod + 真实镜像 Hermes 0.21.5 | UID 10000 / CapEff 0 / 6 项守护契约 / SIGTERM / Pod Delete | **历史 PASS**（2026-10-10 证据，归属旧版独立 AIAgent 架构，不计入当前 Gateway 计数） |
 | **[历史架构] 生产 GitOps 修补部署** | 生产环境集群（commit `6a3d295b0514a6d2124cd15ed3807440f12cd768`） | 34 ACL + 25 runtime + 10 附加检查 / 卷根目录 0700 收紧 / 3 项鉴权探测 | **历史 PASS**（2026-10-11 证据，归属旧版独立 AIAgent 架构，不计入当前 Gateway 计数） |
 | **[历史架构] 显式路由短文本实测** | 生产环境 + Aether 网关 + `z-ai/glm-5.3-flash` | 1 任务（1 POST + 16 GET，30.741s）返回固定标记 | **历史 PASS**（2026-10-11 证据，归属旧版独立 AIAgent 架构，不计入当前 Gateway 计数） |
 | **真实宿主加载验证** | 独立隔离 OpenCode 宿主进程 | 插件状态与工具枚举 | **历史 PASS**（2026-10-10 独立宿主证据：`dist/` 激活，枚举 3 工具，本轮未重跑） |
 
 > **版本增量与验证范围说明**：
-> - **当前 Gateway 方案离线测试**：TypeScript 27 项测试（330 断言）与 Python 29 项单测全数通过，测试套件依托全本机 fake 环境和 `test_gateway.py` 精确模拟 Gateway API 契约（包括断 202 标记未知、已知 run_id 恢复、旧队列隔离、4 次暂时性故障指数退避以及快速 stop），证实了单任务至多 1 次 native POST 及网关 scope 绑定的状态机鲁棒性。
-> - **测试夹具说明**：跨语言集成测试中 `EchoRunner` 回显 inline images 仅为端到端通信测试夹具，绝不代表原生 Gateway 输出附件能力。
-> - **历史证据归属区分**：此前 2026-10-10 与 2026-10-11 的测试记录（TS 21 项 / 145 断言、Python 37 项单测、GitOps commit `6a3d295` 容器部署及 `z-ai/glm-5.3-flash` 显式路由实机调用）均属于旧版独立进程内 AIAgent 架构，保留作为历史归属参考，不作为当前 Gateway 架构的测试计数。
-> - **生产环境网关现场事实**：生产现场已确认既有 Hermes 镜像 `nousresearch/hermes-agent:v2026.9.24`、`HERMES_HOME=/opt/data`、`memory.provider=honcho`；`.env` 中包含有效 `API_SERVER_KEY`，`127.0.0.1:8642` 端口监听且 capabilities 鉴权探测（匿名 401，正确 auth 200 返回 capabilities 对象）全数通过。只读 Honcho 查询已完成（所选目标无条目，仅代表该目标无记录，不证明无其他记忆），身份元数据核对正在进行。
-> - **身份映射与记忆共享隔离**：Web PTY internal credential 经排除，普通新会话可 fallback peerName，微信通常基于 senderID；连接至同一 Gateway 不自动保证 Honcho 同一 user，部署指南须以有效身份 gate 提醒，严禁擅自合并用户身份。
-> - **未执行阶段与技术边界（NOT RUN / NOT PROVEN / UNSUPPORTED）**：
->   - 新版 Gateway 桥接服务及 Sidecar 部署方案仅为建议方案，**尚未在生产环境部署、重启或提交**；
->   - 生产网关真实模型调用尚未在新方案下执行；
->   - 宿主交互式会话中的模型自主工具调用、权限弹窗及自动回投全链路 UI 未运行测试（插件端到端连接及宿主交互验证尚未完成）；
->   - 普通非图片文件输入及原生 Gateway 产物输出附件暂不受支持。
+> - **当前源码与离线自动化测试**：源码 commit `8a4e47cf1f15233988053ce7bdbe6cd29576354e`，实际 `dist/` 构建一致；TypeScript 27 项测试（330 断言）与 Python 29 项单测全数通过，测试套件依托全本机 fake 环境和 `test_gateway.py` 精确模拟 Gateway API 契约（包括断 202 标记未知、已知 run_id 恢复、旧队列隔离、4 次暂时性故障指数退避以及快速 stop），证实了单任务至多 1 次 native POST 及网关 scope 绑定的状态机鲁棒性。
+> - **生产 Sidecar 部署与只读验收（GitOps B）**：通过 GitOps commit `2d639d199bac5eb011efa5ac41cd705c08346c2f` 上线，桥接作为原 `hermes-agent` Pod 的薄 Sidecar 运行，直连本地 `127.0.0.1:8642/v1/runs`；未新建独立 AI Agent 或 profile，保留原 `/opt/data` 及配置，未迁移或替换资料；Flux、网络安全及只读鉴权验收 PASS（非双 LAN 来源实包验证）。
+> - **真实插件端到端模型实测（PASS）**：真实 OpenCode 插件向部署上线的桥接服务发起实际调用并成功完成：
+>   - 纯文本任务：成功返回预期标记 `HERMES_GATEWAY_OK`；
+>   - 图片任务：32×32 纯蓝 PNG（99 字节，以内嵌 Base64 形式提交）成功经 Gateway 识别并回复包含“蓝色”；
+>   - 两个任务在 Bridge SQLite DB 中均对应原 Gateway 的原生 `run_<32hex>`，会话同属 `opencode-<threadUUID>`，原生 GET 200 确认 `completed=true, partial=false, interrupted=false`，输出完全匹配；
+>   - 初始鉴权注意：初次请求曾因客户端进程使用的令牌与配置不一致出现 401，用户手动重启后环境变量与配置对齐并成功执行，启动代码未做修改；旧 401 任务未重放，采用用户批准的新任务 UUID 成功验收。
+> - **历史证据归属区分**：此前 2026-10-10 与 2026-10-11 的测试记录（TS 21 项 / 145 断言、Python 37 项单测、GitOps commit `6a3d295` 独立部署及 `z-ai/glm-5.3-flash` 显式路由实机调用）均属于旧版独立进程内 AIAgent 架构，保留作为历史归属参考，不作为当前 Gateway 架构的测试计数。旧版历史测试曾包含简单工具回传验证；当前 Gateway 链路仍未专门进行自主工具选择与前端 UI 交互验证。
+> - **限制边界与清理完成状态**：
+>   - 仅支持文字及 PNG/JPEG/GIF/WebP 图片；当前插件配置未设置 `uploadRoots`，本地 path 图片调用在入队前直接被拦截，本次图片实测走既有内嵌 base64 分支（内嵌图片无需目录白名单；本地路径上传方式未做验证）；普通非图片文件在当前阶段仍不受支持；
+>   - 仅验证了原 Gateway 链路与配置保持；追加既有资料询问获得有效回应，未逐条核验全部记忆或证明所有 Honcho peer 完全一致（不计入验收 fixtures，文档不包含个人具体资料）；
+>   - 原会话后台消息回传已验证（收到真实文本与图片通知，delivered 置为 true）；真实前端页面呈现、权限确认弹窗及模型自主选工具未做专门 UI 测试；
+>   - **清理与收尾完成（C1/C2）**：旧独立 Deployment 已删除（旧 Pod 为 0），旧 home 与 hermes-profile 孤立目录已清理完毕（移除 556 文件与 27 目录），jobs/DB 完整保留，原 hermes-agent Pod、Deployment 与 Services 均保持不变，未访问原 /opt/data；GitOps 已完成废弃模型凭据字段（`HERMES_BRIDGE_MODEL_API_KEY`）清理（commit `a93555a`），生产 Secret 仅保留有效的 Bridge 与 Gateway 双令牌，验证与鉴权探测全数通过。阶段验收结论以本文档为准，不依赖即将清理的临时路径。
 
 ---
 
@@ -194,6 +200,27 @@ Python 服务端测试套件包含 29 个测试项（耗时 8.430s 无 skip，�
 4. **上游 SDK 契约参考**：
    - 原生 Gateway 任务运行生命周期遵循 NousResearch/hermes-agent 官方稳定契约（参见 tag `v2026.9.24` [api_server_runs.py](https://github.com/NousResearch/hermes-agent/blob/v2026.9.24/gateway/platforms/api_server_runs.py)）。
 
+### 3.8 生产 Gateway Sidecar 部署与真实插件端到端实测 (GitOps B)
+
+在生产环境中完成 GitOps B 部署上线并由真实 OpenCode 插件执行端到端实测验证：
+
+1. **GitOps B 生产部署与基础设施只读验证**：
+   - 生产 GitOps commit `2d639d199bac5eb011efa5ac41cd705c08346c2f`，源码 commit `8a4e47cf1f15233988053ce7bdbe6cd29576354e`，实际 `dist/` 构建完全匹配；
+   - 桥接作为原 `hermes-agent` Pod 的薄 Sidecar 运行，直连本地回环 `127.0.0.1:8642/v1/runs`；未新建独立 AI Agent 或 profile，保留原 `/opt/data` 及配置，未迁移或替换资料；
+   - Flux、网络策略、安全基线、源码标注与只读鉴权验收全数通过（注：此项为服务直连与只读检查，非双 LAN 来源实包验证）。
+2. **真实插件端到端模型实机调用**：
+   - **文字任务**：真实 OpenCode 插件提交纯文本任务，Bridge 正确转发原生 Gateway 并由模型返回预期标记 `HERMES_GATEWAY_OK`；
+   - **图片任务**：32×32 纯蓝 PNG（99 字节，以内嵌 Base64 形式提交），经 Gateway 原生 Run 调度并由模型成功识别，回复包含“蓝色”；
+   - **状态机与持久化一致性**：两个任务在 Bridge SQLite DB 中均对应原 Gateway 的原生 `run_<32hex>`，会话同属 `opencode-<threadUUID>`，原生 GET 200 确认 `completed=true, partial=false, interrupted=false`，输出完全匹配；
+   - **上传路径与格式边界约束**：当前插件配置未设置 `uploadRoots`，本地 path 图片调用在入队前直接被拦截，本次图片实测依托既有内嵌 base64 分支完成（内嵌图片无需目录白名单；本地路径上传方式未做验证）；普通非图片文件在当前阶段仍不受支持。
+3. **初始鉴权对齐与环境恢复**：
+   - 初次请求曾因客户端进程使用的令牌与配置不一致产生 401，用户手动重启客户端与服务使环境与配置对齐后恢复正常，启动代码未做修改；旧 401 任务未予重放，采用用户批准的新任务 UUID 成功完成端到端验收；
+   - 追加既有资料询问获得有效回应，未逐条核验全部记忆或证明所有 Honcho peer 完全一致（不计入验收 fixtures，文档不包含个人具体资料）。
+4. **旧独立环境与废弃凭据清理全数完成 (C1 & C2)**：
+   - **孤立环境清理 (C1 PASS)**：旧独立 Deployment 已删除（旧 Pod 为 0），旧 `home` 与 `hermes-profile` 孤立目录已清理完毕（移除 556 个文件与 27 个目录）；`jobs` 目录及 bridge SQLite 数据库完整保留，原 `hermes-agent` Pod、Deployment 与 Services 均保持运行，未访问原 `/opt/data`；
+   - **凭据字段清理 (C2 PASS)**：通过 GitOps commit `a93555adf198ac86f91976abcf6849e6ed4166e4` 完成废弃模型 API Key 字段（`HERMES_BRIDGE_MODEL_API_KEY`）删除，live Secret 仅保留 `HERMES_BRIDGE_TOKEN` 与 `HERMES_GATEWAY_TOKEN` 双有效字段，渲染与一致性校验 PASS；环回探测 bridge 404 与 native capabilities 200 保持正常，0 新模型调用，服务 0 重启；
+   - **持久依据说明**：阶段验收结论完整记录于本正式文档，不以即将清理的临时测试路径作为唯一凭证；正式源码、测试套件与运行数据均完整保留。
+
 ---
 
 ## 4. 真实外部实体与模型联调现状
@@ -250,14 +277,17 @@ Python 服务端测试套件包含 29 个测试项（耗时 8.430s 无 skip，�
 | **[历史架构] 容器 PID 1 验收** | **历史 PASS** | 2026-10-10 历史证据：真实容器 PID 1 守护契约与删除全通过（0 POST，未调模型） |
 | **[历史架构] 生产 GitOps 部署** | **历史 PASS** | 2026-10-11 历史证据：commit `6a3d295` 部署生效，34 ACL + 25 runtime + 10 附加全过，目录 0700 收紧 |
 | **[历史架构] 显式路由单任务** | **历史 PASS** | 2026-10-11 历史证据：Aether + `z-ai/glm-5.3-flash` 返回 `HERMES_BRIDGE_OK` |
-| **原生 Gateway 模型真实调用** | **NOT RUN** | 当前新架构尚未在生产环境通过 Gateway 桥接执行真实模型推理任务 |
-| **生产 Gateway 桥接部署 (Sidecar)** | **NOT RUN / NOT DEPLOYED** | Sidecar 方案仅为建议方案，尚未在生产环境部署、重启或提交 |
-| **模型图片视觉理解** | **INCONCLUSIVE** | 图像在发送前被 Hermes 移除，未送达上游模型，不可得出结论 |
+| **生产 Gateway 桥接部署 (Sidecar GitOps B)** | **PASS** | commit `2d639d1`，挂载原 hermes-agent Pod 直连 8642，未建独立 profile，只读验收通过 |
+| **原生 Gateway 模型真实调用 (当前方案)** | **PASS** | 真实插件文本返回 `HERMES_GATEWAY_OK`；32×32 纯蓝 PNG（99B 内嵌 Base64）返回蓝色 |
+| **[历史架构] 模型图片视觉理解** | **历史 INCONCLUSIVE** | 2026-10-10 历史独立架构证据：图像在发送前被 Hermes 移除，未送达上游模型 |
+| **简单图片颜色识别 (当前 Gateway 链路)** | **PASS** | 32×32 纯蓝 PNG（内嵌 Base64）成功识别并回复蓝色（仅限当前单一场景测试，不夸大推导通用视觉能力） |
 | **普通文件与输出附件能力** | **UNSUPPORTED** | 普通非图片文件提交前直接拦截；原生 Gateway 暂无输出附件传输契约（MEDIA 报 `unsupported_output` 失败） |
 | **跨入口既有身份/记忆一致性** | **NOT PROVEN** | 长远目标是共用同一既有身份而非自动合并记忆；需身份映射匹配，连接同一 Gateway 不自动保证记忆共享 |
 | **第二局域网段实机数据流转** | **NOT RUN** | 规则检查不可替代双 LAN 实测，第二授权网段（示例 `192.168.10.0/24`）实机互联流量未运行 |
 | **入站客户端外部源地址证实** | **NOT PROVEN** | 证据仅含本地 socket 地址，未关联外部网络五元组，客户端外部真实源地址身份未证实 |
-| **宿主全链路 UI 回投与自主工具** | **NOT RUN** | 尚未在真实聊天 UI 与自主模型决策场景中联调（旧架构曾验证简单工具回传，新 Gateway 链路尚未运行测试） |
+| **宿主全链路 UI 回投与自主工具** | **NOT RUN** | 原会话后台消息回传已验证；真实前端页面呈现、权限确认弹窗及模型自主选工具未做专门 UI 测试（旧架构曾验证简单工具回传） |
+| **旧独立环境收尾清理 (C1)** | **PASS** | 旧独立 Deployment 已删除（旧 Pod 0），旧 home 与 hermes-profile 目录已移除（556 文件/27 目录）；jobs/DB 完整保留，未访问原 /opt/data |
+| **旧模型凭据字段清理 (C2)** | **PASS** | GitOps commit `a93555a` 完成废弃 Key 字段移除；live Secret 仅保留有效双令牌，探测正常 |
 
 ---
 
@@ -267,5 +297,6 @@ Python 服务端测试套件包含 29 个测试项（耗时 8.430s 无 skip，�
 2. **身份隔离与 Honcho 记忆边界**：本次既有 Gateway 配置使用 Honcho，目标是**共用同一既有用户身份**。需区分用户 peer 与客户端/助手 peer，并核对入口身份、别名及默认值的实际解析结果；客户端名称不同不代表用户不同。当前跨入口映射仍待确认，不据此修改或合并身份数据。
 3. **格式与附件能力边界**：当前输入附件严格限定为图片格式（PNG/JPEG/GIF/WebP），普通文件（PDF/ZIP/TXT 等）在提交前直接拦截；原生 Gateway `/v1/runs` 暂无输出附件传输契约，模型输出若含 `MEDIA:...` 则置为 `failed`（错误码 `unsupported_output`，客户端查询恒返回 HTTP 200）。此外，原生 Gateway 规范报文受 `MAX_NATIVE_BODY = 10,000,000 字节` 硬上限约束，超限直接失败。系统不读取原生 Gateway 容器内部文件系统，不假装已有普通文件理解或模型自主输出附件能力。
 4. **Outbox 存储膨胀**：当前 Outbox 数据持久化保留于宿主存储中，未内置定时自动清理策略，需注意会话长期使用的存储容量。
-5. **网关路由与当前代码边界**：当前代码实现已切换为 `GatewayRunner` 对接原生 Gateway `/v1/runs`（注意生产环境尚未部署/重启生效），旧版显式模型路由环境变量组与 `--model` 选项均已废弃；Sidecar 部署方案仅为建议方案，尚未在生产环境执行部署、重启或提交；宿主交互式会话中的模型自主工具调用、权限弹窗及自动回投全链路 UI 未运行测试（插件端到端连接及宿主交互验证尚未完成）。
+5. **网关路由与当前部署边界**：当前代码实现已切换为 `GatewayRunner` 对接原生 Gateway `/v1/runs`，旧版显式模型路由环境变量组与 `--model` 选项均已废弃；生产环境已通过 GitOps B（commit `2d639d1`）作为 Sidecar 部署上线并完成真实插件文本与内嵌图片实测；原会话后台消息回传已验证，真实前端页面呈现、权限确认弹窗及模型自主选工具未做专门 UI 测试。
 6. **容器 PID 1 守护入口实机验收与生产边界**：`hermes_bridge.init` 在同镜像真实容器 PID 1 环境下的进程形态、6 项 supervisor 契约、优雅终止及 Pod 删除已完成实机验收并全部 PASS。在生产 Kubernetes 部署中，此前卷根目录实测为 `02770`（`fsGroup` 上游存在放宽权限可能），修补后通过 init 容器使用固定目录文件描述符校验卷根目录并安全收紧为 `0700`（`10000:10000`），三个子目录沿用各自初始化检查，保证工作区全路径严格私有；编排层仍须保持 `hostPID: false`、`shareProcessNamespace: false` 并配置充足的终止宽限期（建议 30s）。当前测试覆盖了孤儿自然退出的回收，对脱离会话逃逸的后代仍依赖容器退出时内核清理 PID 命名空间；单次实测耗时受网络与 API 轮询影响，不作为固定性能 SLA 承诺。
+7. **清理与收尾全数完成（C1/C2）**：旧独立 Deployment 与旧 home、hermes-profile 两目录已完成清理删除（556 文件与 27 目录移除，旧 Pod 归零），jobs 目录及 bridge SQLite DB 完整保留，原 hermes-agent Pod、Deployment 与 Services 均保持运行，未访问原 `/opt/data`；废弃模型 API Key 字段（`HERMES_BRIDGE_MODEL_API_KEY`）已通过 GitOps commit `a93555a` 彻底移除，仅保留有效双令牌。本阶段目标完整达成。

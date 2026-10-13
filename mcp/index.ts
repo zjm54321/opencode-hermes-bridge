@@ -1,5 +1,5 @@
 import { config as bridgeConfig } from '../src/config.js'
-import { mcpConfig } from './config.js'
+import { configuredPrincipal, mcpConfig } from './config.js'
 import { createFileIngress } from './file-ingress.js'
 import { createMcpHttpServer } from './http.js'
 import { McpBridgeService } from './service.js'
@@ -8,7 +8,7 @@ export async function startMcp(env: Record<string, string | undefined> = process
   const config = mcpConfig(env)
   const service = await McpBridgeService.open({
     bridgeConfig: bridgeConfig({}, env), stateDirectory: config.stateDirectory, publicOrigin: config.publicOrigin,
-    allowedPrincipal: { issuer: config.issuer, subject: config.allowedSubject }, downloadFile: createFileIngress(config.fileOrigins), httpDownloads: config.httpDownloads,
+    allowedPrincipal: configuredPrincipal(config), downloadFile: createFileIngress(config.fileOrigins), httpDownloads: config.httpDownloads,
   })
   const server = createMcpHttpServer(config, service)
   try {

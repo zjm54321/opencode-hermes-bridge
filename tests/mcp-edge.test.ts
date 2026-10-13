@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { expect, spyOn, test } from 'bun:test'
 import { request as httpRequest, IncomingMessage, type ClientRequest, type IncomingHttpHeaders } from 'node:http'
 import { Socket } from 'node:net'
 import { EventEmitter } from 'node:events'
@@ -7,8 +7,12 @@ import type { DetailedPeerCertificate } from 'node:tls'
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT, type JWTPayload } from 'jose'
 import type { CallToolResult, ListToolsResult } from '@modelcontextprotocol/server'
 import { randomUUID } from 'node:crypto'
-import { JwtAuthenticator } from '../mcp/auth.js'
-import { mcpConfig } from '../mcp/config.js'
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { join } from 'node:path'
+import { JwtAuthenticator, privateTunnelAuthority } from '../mcp/auth.js'
+import { configuredPrincipal, mcpConfig, type McpConfig } from '../mcp/config.js'
+import { startMcp } from '../mcp/index.js'
+import { McpBridgeService } from '../mcp/service.js'
 import { createFileIngress, publicAddress, type IngressIO } from '../mcp/file-ingress.js'
 import { createMcpHttpServer, type EdgeService } from '../mcp/http.js'
 import { McpError, resourceURI, type Principal, type PublicFile, type PublicResult, type SubmitInput } from '../mcp/contracts.js'
@@ -19,7 +23,9 @@ const configEnv = {
   HERMES_MCP_JWKS_URL: 'https://issuer.example.test/keys', HERMES_MCP_SUBJECT: 'allowed-test-subject',
   HERMES_MCP_STATE_DIR: '/tmp/opencode/mcp-edge-unused', HERMES_MCP_FILE_ORIGINS: '["https://files.example.test"]',
 }
-const config = mcpConfig(configEnv)
+const parsedConfig = mcpConfig(configEnv)
+if (parsedConfig.authMode !== 'oauth') throw new Error('Expected the default OAuth config')
+const config = parsedConfig
 async function identity() {
   const pair = await generateKeyPair('ES256')
   const jwk = await exportJWK(pair.publicKey)
@@ -62,14 +68,16 @@ function stub() {
   }
   return { service, calls, reads, poison: () => { poison = true } }
 }
-async function listening(authenticator: JwtAuthenticator, service = stub().service, configuration = config) {
+async function listening(authenticator?: JwtAuthenticator, service = stub().service, configuration: McpConfig = config, bindHost = configuration.host) {
   const server = createMcpHttpServer(configuration, service, authenticator)
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, bindHost, () => { server.off('error', reject); resolve() }) })
   const address = server.address()
   if (!address || typeof address === 'string') throw new Error('Missing test listener')
+  const authority = `${configuration.host === '::1' ? '[::1]' : configuration.host}:${address.port}`
   return {
+    authority,
     request: (path: string, options: { method?: string; headers?: Record<string, string>; body?: string } = {}) => new Promise<{ status: number; headers: IncomingHttpHeaders; bytes: Buffer; text: string }>((resolve, reject) => {
-      const req = httpRequest({ host: '127.0.0.1', port: address.port, path, method: options.method ?? 'GET', headers: { Host: new URL(config.publicOrigin).host, ...options.headers }, agent: false }, res => {
+      const req = httpRequest({ host: configuration.host, port: address.port, path, method: options.method ?? 'GET', headers: { Host: configuration.authMode === 'private-tunnel' ? authority : new URL(configuration.publicOrigin).host, ...options.headers }, agent: false }, res => {
         const chunks: Buffer[] = []
         res.on('data', chunk => chunks.push(Buffer.from(chunk)))
         res.once('error', reject)
@@ -126,6 +134,143 @@ test('OAuth resource authentication: signature/claims/subject/scope and exact Ho
     expect(forbidden.status).toBe(403)
     expect(forbidden.text).not.toContain(good)
   } finally { await h.close() }
+})
+
+const privateEnv = {
+  HERMES_MCP_AUTH_MODE: 'private-tunnel', HERMES_MCP_PRIVATE_OWNER: 'fixture-owner',
+  HERMES_MCP_TUNNEL_ID: `tunnel_${'a'.repeat(32)}`, HERMES_MCP_STATE_DIR: '/tmp/opencode/mcp-private-unused',
+  HERMES_MCP_FILE_ORIGINS: '["https://files.example.test"]',
+}
+
+test('private tunnel is a fixed-owner loopback trust domain, without JWT/JWKS or public discovery', async () => {
+  const privateConfig = mcpConfig(privateEnv)
+  if (privateConfig.authMode !== 'private-tunnel') throw new Error('Expected private mode')
+  const owner = configuredPrincipal(privateConfig)
+  expect(owner).toEqual({ issuer: 'urn:hermes-mcp:private-tunnel:v1', subject: hashBytes(Buffer.from(JSON.stringify(['fixture-owner', privateEnv.HERMES_MCP_TUNNEL_ID]))) })
+  expect(config.authMode).toBe('oauth')
+  expect(privateConfig.httpDownloads).toBe(false)
+  expect('jwksURL' in privateConfig).toBe(false)
+  expect('issuer' in privateConfig).toBe(false)
+  expect(configuredPrincipal(mcpConfig({ ...privateEnv, OPENAI_API_KEY: 'fixture-key-rotation-not-an-identity' }))).toEqual(owner)
+  for (const mode of ['', 'none', 'PRIVATE-TUNNEL']) expect(() => mcpConfig({ ...privateEnv, HERMES_MCP_AUTH_MODE: mode })).toThrow('HERMES_MCP_AUTH_MODE')
+  for (const key of ['HERMES_MCP_PRIVATE_OWNER', 'HERMES_MCP_TUNNEL_ID']) {
+    for (const value of [undefined, '', ' ', 'x\ny', 'x\u0085y', 'a'.repeat(257)]) expect(() => mcpConfig({ ...privateEnv, [key]: value })).toThrow()
+  }
+  for (const host of ['0.0.0.0', '::', 'localhost', '127.0.0.2', '::ffff:127.0.0.1']) expect(() => mcpConfig({ ...privateEnv, HERMES_MCP_HOST: host })).toThrow()
+  for (const tunnelID of ['fixture-tunnel', `tunnel_${'A'.repeat(32)}`, `tunnel_${'a'.repeat(31)}`]) expect(() => mcpConfig({ ...privateEnv, HERMES_MCP_TUNNEL_ID: tunnelID })).toThrow('HERMES_MCP_TUNNEL_ID')
+  expect(() => mcpConfig({ ...privateEnv, HERMES_MCP_HTTP_DOWNLOADS: '1' })).toThrow('HTTP_DOWNLOADS=0')
+  expect(() => mcpConfig({ ...privateEnv, HERMES_MCP_PORT: '0' })).toThrow('HERMES_MCP_PORT')
+  const bound = { address: '127.0.0.1', family: 'IPv4', port: 8790 }
+  expect(privateTunnelAuthority(privateConfig, bound, { localAddress: '::ffff:127.0.0.1', remoteAddress: '::ffff:127.0.0.1' })).toBe('127.0.0.1:8790')
+  for (const socket of [{ localAddress: '10.0.0.1', remoteAddress: '127.0.0.1' }, { localAddress: '127.0.0.1', remoteAddress: '::ffff:10.0.0.1' }, { localAddress: undefined, remoteAddress: undefined }]) expect(privateTunnelAuthority(privateConfig, bound, socket)).toBeUndefined()
+  expect(privateTunnelAuthority(privateConfig, { ...bound, address: '0.0.0.0' }, { localAddress: '127.0.0.1', remoteAddress: '127.0.0.1' })).toBeUndefined()
+  let outgoing = 0
+  const fetch = spyOn(globalThis, 'fetch').mockImplementation(Object.assign(async () => { outgoing++; throw new Error('No private-mode JWKS or sentinel HTTP') }, { preconnect: () => {} }))
+  try {
+    for (const host of ['127.0.0.1', '::1']) {
+      const configured = mcpConfig({ ...privateEnv, HERMES_MCP_HOST: host })
+      const fake = stub()
+      const h = await listening(undefined, fake.service, configured)
+      const headers = { Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json', 'MCP-Protocol-Version': '2025-11-25' }
+      let id = 0
+      const rpc = (method: string, params?: unknown, extraHeaders: Record<string, string> = {}) => h.request('/mcp', { method: 'POST', headers: { ...headers, ...extraHeaders }, body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, ...(params ? { params } : {}) }) })
+      try {
+        const init = await rpc('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'private-fixture', version: '1' } })
+        expect(init.status).toBe(200)
+        expect(init.headers['www-authenticate']).toBeUndefined()
+        expect(init.text).not.toContain('private-tunnel.invalid')
+        expect(JSON.parse((await rpc('tools/list')).text).result.tools.map((tool: { name: string }) => tool.name)).toEqual(['hermes_submit', 'hermes_status', 'hermes_result'])
+        const input = { request_id: randomUUID(), text: 'fixed private owner', wait_seconds: 0 }
+        const submitted = await rpc('tools/call', { name: 'hermes_submit', arguments: input }, {
+          Authorization: 'Bearer invalid-and-ignored', 'X-Forwarded-User': 'attacker', 'X-Forwarded-Host': 'attacker.test',
+          'Cf-Access-Authenticated-User-Email': 'attacker@example.test', 'Cf-Access-Jwt-Assertion': 'not-an-identity',
+        })
+        expect(JSON.parse(submitted.text).result.structuredContent).toEqual(dto)
+        expect(fake.calls).toEqual([{ principal: owner, input }])
+        const read = await rpc('resources/read', { uri: file.uri })
+        expect(JSON.parse(read.text).result.contents).toEqual([{ uri: file.uri, mimeType: file.mime, blob: bytes.toString('base64') }])
+        expect(fake.reads).toEqual([{ principal: owner, uri: file.uri }])
+        for (const path of ['/.well-known/oauth-protected-resource', `/files/${capability}`]) {
+          const response = await h.request(path)
+          expect(response.status).toBe(404)
+          expect(response.headers['www-authenticate']).toBeUndefined()
+          expect(response.text).not.toContain('private-tunnel.invalid')
+        }
+        const rejected: Record<string, string>[] = [{ Host: 'attacker.test' }, { Host: `localhost:${h.authority.split(':').at(-1)}` }, { Origin: 'https://chatgpt.com.evil.test' }, { Origin: 'http://attacker.test' }]
+        for (const bad of rejected) expect((await h.request('/health', { headers: bad })).status).toBe(403)
+        expect((await h.request('/health', { headers: { Origin: `http://${h.authority}` } })).status).toBe(200)
+        expect((await h.request('/health', { headers: { Origin: 'https://chatgpt.com' } })).status).toBe(200)
+      } finally { await h.close() }
+    }
+    const wildcard = await listening(undefined, stub().service, privateConfig, '0.0.0.0')
+    try {
+      for (const path of ['/health', '/mcp', '/.well-known/oauth-protected-resource', `/files/${capability}`]) {
+        const response = await wildcard.request(path)
+        expect(response.status).toBe(403)
+        expect(response.headers['www-authenticate']).toBeUndefined()
+      }
+    } finally { await wildcard.close() }
+    expect(outgoing).toBe(0)
+  } finally { fetch.mockRestore() }
+})
+
+test('private owner state survives restart; mode/owner/tunnel changes fail before Bridge HTTP or state rebinding', async () => {
+  const root = await mkdtemp('/tmp/opencode/hermes-private-state-')
+  const jobs = new Map<string, unknown>()
+  let requests = 0
+  let posts = 0
+  const backend = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: async request => {
+    requests++
+    const url = new URL(request.url)
+    if (url.pathname === '/v1/capabilities') return new Response(null, { status: 404 })
+    if (request.method === 'POST' && url.pathname === '/v1/jobs') {
+      posts++
+      const input = await request.json() as { id: string }
+      jobs.set(input.id, { id: input.id, status: 'completed', text: 'private fixture done', attachments: [], error: null })
+      return Response.json({ id: input.id }, { status: 202 })
+    }
+    const job = jobs.get(url.pathname.split('/').at(-1)!)
+    return job ? Response.json(job) : new Response(null, { status: 404 })
+  } })
+  const env = { ...privateEnv, HERMES_MCP_STATE_DIR: join(root, 'state'), HERMES_BRIDGE_URL: backend.url.origin,
+    HERMES_BRIDGE_TOKEN: 'private-test-bridge-token', HERMES_BRIDGE_OUTPUT_DIR: join(root, 'outputs') }
+  const privateConfig = mcpConfig(env)
+  const owner = configuredPrincipal(privateConfig)
+  let service: McpBridgeService | undefined
+  const open = () => McpBridgeService.open({
+    bridgeConfig: { url: backend.url.origin, token: env.HERMES_BRIDGE_TOKEN, directory: root, outputDir: env.HERMES_BRIDGE_OUTPUT_DIR,
+      uploadRoots: [], pollMs: 5, httpTimeoutMs: 1000, jobTimeoutMs: 30_000 },
+    stateDirectory: privateConfig.stateDirectory, publicOrigin: privateConfig.publicOrigin, allowedPrincipal: owner,
+    downloadFile: async () => { throw new Error('No file import in state fixture') }, httpDownloads: false,
+  })
+  try {
+    const input = { request_id: randomUUID(), text: 'persist private request', wait_seconds: 1 }
+    service = await open()
+    const first = await service.submit(owner, input)
+    expect(first.status).toBe('completed')
+    expect(posts).toBe(1)
+    await service.close()
+    service = await open()
+    expect(await service.submit(owner, input)).toEqual(first)
+    expect(posts).toBe(1)
+    await service.close(); service = undefined
+    const saved = await readFile(join(root, 'state/state.json'))
+    const before = requests
+    for (const change of [
+      { HERMES_MCP_PRIVATE_OWNER: 'another-owner' }, { HERMES_MCP_TUNNEL_ID: `tunnel_${'b'.repeat(32)}` },
+      { HERMES_MCP_AUTH_MODE: 'oauth', ...configEnv, HERMES_MCP_STATE_DIR: env.HERMES_MCP_STATE_DIR },
+    ]) {
+      // Exercise the real index startup path: owner validation precedes Bridge.start and listener creation.
+      await expect((async () => {
+        const unexpected = await startMcp({ ...env, ...change })
+        await unexpected.close()
+      })()).rejects.toThrow('Service unavailable')
+      expect(await readFile(join(root, 'state/state.json'))).toEqual(saved)
+      await expect(stat(join(root, 'state/writer.lock'))).rejects.toThrow()
+      expect(requests).toBe(before)
+    }
+    expect(posts).toBe(1)
+  } finally { await service?.close(); backend.stop(true); await rm(root, { recursive: true, force: true }) }
 })
 
 test('official MCP resources/read returns authenticated binary blobs; HTTP downloads are opt-in', async () => {

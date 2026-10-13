@@ -1,0 +1,167 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "v1", "kind": "ServiceAccount",
+      "metadata": {"name": "hermes-mcp", "namespace": "ai-services"},
+      "automountServiceAccountToken": false
+    },
+    {
+      "apiVersion": "v1", "kind": "ConfigMap",
+      "metadata": {"name": "hermes-mcp", "namespace": "ai-services"},
+      "data": {
+        "auth-mode": "private-tunnel",
+        "private-owner": "REPLACE_ME_PRIVATE_OWNER",
+        "tunnel-id": "REPLACE_ME_TUNNEL_ID",
+        "file-origins": "[]"
+      }
+    },
+    {
+      "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+      "metadata": {"name": "hermes-mcp-private", "namespace": "ai-services"},
+      "spec": {
+        "accessModes": ["ReadWriteOnce"], "volumeMode": "Filesystem",
+        "storageClassName": "REPLACE_ME_DEDICATED_STORAGE_CLASS",
+        "resources": {"requests": {"storage": "5Gi"}}
+      }
+    },
+    {
+      "apiVersion": "apps/v1", "kind": "Deployment",
+      "metadata": {"name": "hermes-mcp", "namespace": "ai-services"},
+      "spec": {
+        "replicas": 1, "strategy": {"type": "Recreate"},
+        "selector": {"matchLabels": {"app": "hermes-mcp"}},
+        "template": {
+          "metadata": {"labels": {"app": "hermes-mcp"}},
+          "spec": {
+            "serviceAccountName": "hermes-mcp", "automountServiceAccountToken": false,
+            "hostNetwork": false, "hostPID": false, "hostIPC": false,
+            "shareProcessNamespace": false, "enableServiceLinks": false,
+            "terminationGracePeriodSeconds": 45,
+            "securityContext": {
+              "runAsNonRoot": true, "runAsUser": 10000, "runAsGroup": 10000,
+              "seccompProfile": {"type": "RuntimeDefault"}
+            },
+            "initContainers": [
+              {
+                "name": "volume-roots", "image": "REPLACE_ME_MCP_IMAGE",
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["bun", "/app/volume-init.mjs", "roots"],
+                "securityContext": {
+                  "runAsNonRoot": false, "runAsUser": 0, "runAsGroup": 0,
+                  "allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true,
+                  "capabilities": {"drop": ["ALL"], "add": ["CHOWN", "FOWNER"]}
+                },
+                "resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"cpu": "100m", "memory": "128Mi"}},
+                "volumeMounts": [
+                  {"name": "private-data", "mountPath": "/work/data"},
+                  {"name": "mcp-temp", "mountPath": "/work/mcp-temp"},
+                  {"name": "tunnel-temp", "mountPath": "/work/tunnel-temp"}
+                ]
+              },
+              {
+                "name": "volume-private", "image": "REPLACE_ME_MCP_IMAGE",
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["bun", "/app/volume-init.mjs", "private"],
+                "env": [
+                  {"name": "HERMES_MCP_AUTH_MODE", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "auth-mode"}}},
+                  {"name": "HERMES_MCP_PRIVATE_OWNER", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "private-owner"}}},
+                  {"name": "HERMES_MCP_TUNNEL_ID", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "tunnel-id"}}}
+                ],
+                "securityContext": {"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": {"drop": ["ALL"]}},
+                "resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"cpu": "100m", "memory": "128Mi"}},
+                "volumeMounts": [
+                  {"name": "private-data", "mountPath": "/work/data"},
+                  {"name": "mcp-temp", "mountPath": "/work/mcp-temp"},
+                  {"name": "tunnel-temp", "mountPath": "/work/tunnel-temp"}
+                ]
+              }
+            ],
+            "containers": [
+              {
+                "name": "mcp", "image": "REPLACE_ME_MCP_IMAGE", "imagePullPolicy": "IfNotPresent",
+                "env": [
+                  {"name": "HERMES_MCP_AUTH_MODE", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "auth-mode"}}},
+                  {"name": "HERMES_MCP_PRIVATE_OWNER", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "private-owner"}}},
+                  {"name": "HERMES_MCP_TUNNEL_ID", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "tunnel-id"}}},
+                  {"name": "HERMES_MCP_FILE_ORIGINS", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "file-origins"}}},
+                  {"name": "HERMES_MCP_HOST", "value": "127.0.0.1"},
+                  {"name": "HERMES_MCP_PORT", "value": "8790"},
+                  {"name": "HERMES_MCP_HTTP_DOWNLOADS", "value": "0"},
+                  {"name": "HERMES_MCP_STATE_DIR", "value": "/private/state"},
+                  {"name": "HERMES_BRIDGE_OUTPUT_DIR", "value": "/private/outputs"},
+                  {"name": "HERMES_BRIDGE_URL", "value": "http://hermes-bridge.ai-services.svc.cluster.local:8787"},
+                  {"name": "HERMES_BRIDGE_TOKEN", "valueFrom": {"secretKeyRef": {"name": "hermes-mcp-bridge", "key": "token"}}},
+                  {"name": "HOME", "value": "/tmp"}, {"name": "TMPDIR", "value": "/tmp"}
+                ],
+                "securityContext": {"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": {"drop": ["ALL"]}},
+                "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": "1", "memory": "512Mi"}},
+                "volumeMounts": [
+                  {"name": "private-data", "mountPath": "/private"},
+                  {"name": "mcp-temp", "mountPath": "/tmp"}
+                ],
+                "readinessProbe": {"exec": {"command": ["bun", "/app/probe.mjs"]}, "periodSeconds": 10, "timeoutSeconds": 5, "failureThreshold": 3},
+                "livenessProbe": {"exec": {"command": ["bun", "/app/probe.mjs", "--live"]}, "initialDelaySeconds": 30, "periodSeconds": 20, "timeoutSeconds": 5, "failureThreshold": 3}
+              },
+              {
+                "name": "tunnel-client",
+                "image": "ghcr.io/openai/tunnel-client:v0.0.16@sha256:4605ea909701668d3bdcbe6152558e068e24006aa96ca5518ca67f786a1bce13",
+                "imagePullPolicy": "IfNotPresent",
+                "args": ["--control-plane.api-key=file:/run/secrets/tunnel_api_key"],
+                "env": [
+                  {"name": "CONTROL_PLANE_TUNNEL_ID", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "tunnel-id"}}},
+                  {"name": "MCP_SERVER_URL", "value": "http://127.0.0.1:8790/mcp"},
+                  {"name": "HEALTH_LISTEN_ADDR", "value": "127.0.0.1:8080"},
+                  {"name": "ALLOW_REMOTE_UI", "value": "false"}, {"name": "OPEN_WEB_UI", "value": "false"},
+                  {"name": "HOME", "value": "/tmp"}, {"name": "TMPDIR", "value": "/tmp"},
+                  {"name": "XDG_CONFIG_HOME", "value": "/tmp/config"}, {"name": "XDG_CACHE_HOME", "value": "/tmp/cache"},
+                  {"name": "XDG_STATE_HOME", "value": "/tmp/state"}, {"name": "XDG_RUNTIME_DIR", "value": "/tmp/run"}
+                ],
+                "securityContext": {"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": {"drop": ["ALL"]}},
+                "resources": {"requests": {"cpu": "50m", "memory": "64Mi"}, "limits": {"cpu": "500m", "memory": "256Mi"}},
+                "volumeMounts": [
+                  {"name": "tunnel-key", "mountPath": "/run/secrets", "readOnly": true},
+                  {"name": "tunnel-temp", "mountPath": "/tmp"}
+                ]
+              }
+            ],
+            "volumes": [
+              {"name": "private-data", "persistentVolumeClaim": {"claimName": "hermes-mcp-private"}},
+              {"name": "mcp-temp", "emptyDir": {"medium": "Memory", "sizeLimit": "128Mi"}},
+              {"name": "tunnel-temp", "emptyDir": {"medium": "Memory", "sizeLimit": "64Mi"}},
+              {"name": "tunnel-key", "secret": {"secretName": "hermes-mcp-tunnel", "defaultMode": 292, "items": [{"key": "api-key", "path": "tunnel_api_key"}]}}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+      "metadata": {"name": "hermes-mcp-isolation", "namespace": "ai-services"},
+      "spec": {
+        "podSelector": {"matchLabels": {"app": "hermes-mcp"}},
+        "policyTypes": ["Ingress", "Egress"], "ingress": [],
+        "egress": [
+          {
+            "to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}}, "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}}}],
+            "ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]
+          },
+          {"to": [{"podSelector": {"matchLabels": {"app": "hermes-agent"}}}], "ports": [{"protocol": "TCP", "port": 8787}]},
+          {
+            "to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/3"]}}],
+            "ports": [{"protocol": "TCP", "port": 443}]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+      "metadata": {"name": "hermes-agent-from-hermes-mcp", "namespace": "ai-services"},
+      "spec": {
+        "podSelector": {"matchLabels": {"app": "hermes-agent"}}, "policyTypes": ["Ingress"],
+        "ingress": [{"from": [{"podSelector": {"matchLabels": {"app": "hermes-mcp"}}}], "ports": [{"protocol": "TCP", "port": 8787}]}]
+      }
+    }
+  ]
+}

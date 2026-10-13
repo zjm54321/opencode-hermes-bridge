@@ -1,11 +1,15 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# ChatGPT Remote MCP 服务接入指南
+# ChatGPT Remote MCP 服务接入指南 (公网 OAuth 模式)
 
-本文档介绍针对 ChatGPT 网页端（Business / Enterprise 工作区）接入的 Remote MCP 服务架构、工具契约、OAuth 保护与安全边界。
+本文档介绍针对 ChatGPT 网页端（Business / Enterprise 工作区）接入的 Remote MCP 服务架构、工具契约、公网 OAuth 保护与安全边界。
 
+> **两种接入方案导航**：
+> - **方案一：公网 OAuth 模式（本文档）**：默认模式（`HERMES_MCP_AUTH_MODE=oauth`），通过公网 HTTPS 反向代理暴露端点，依赖外部标准 OAuth 授权服务器与 JWT 保护；
+> - **方案二：官方私有隧道模式（推荐个人免 IdP 使用）**：设置 `HERMES_MCP_AUTH_MODE=private-tunnel`，采用 OpenAI 官方 [Secure MCP Tunnel](PRIVATE_TUNNEL.md) 建立出站隧道直连（选 Tunnel + No authentication），无需搭建外部 OAuth 授权服务器或开放公网端口。详细规范参见 [docs/PRIVATE_TUNNEL.md](PRIVATE_TUNNEL.md)。
+>
 > **重要前提与状态声明**：
-> 1. **本地与真实 Host 验证现状**：当前已完成 MCP 标准服务实现并通过全套离线测试（17 项测试 / 478 断言）；在隔离环境中经真实 OpenCode 2.0.27 宿主实际调用 MCP 三工具并通过 `read_mcp_resource` 验证了 318 字节 ZIP 原件完整闭环（哈希一致，无自动落盘）；真实 ChatGPT 网页端附件自动绑定与商业 OAuth 账户接入仍待实测，生产环境未部署上线。
-> 2. **真实接入前置条件**：需所属 ChatGPT 工作区管理员允许添加自定义 MCP App、外部配置独立的真实 OAuth 2.0 授权服务器、以及具备公网 HTTPS 域名与反向代理。
+> 1. **本地与真实 Host 验证现状**：此前公网 OAuth 模式完成基线测试（17 项测试 / 478 断言）及真实 OpenCode 2.0.27 宿主 318 字节 ZIP 闭环验收；本轮双模式本地测试 20 项 / 667 断言已通过，详见 [docs/VERIFICATION.md](VERIFICATION.md)；真实 Tunnel / ChatGPT 仍未测，生产环境未部署上线。
+> 2. **公网 OAuth 模式前置条件**：需所属 ChatGPT 工作区管理员允许添加自定义 MCP App、外部配置独立的真实 OAuth 2.0 授权服务器、以及具备公网 HTTPS 域名与反向代理。
 
 ---
 
@@ -180,7 +184,7 @@ bun run typecheck:mcp
 ```
 
 > **本地验证与真实宿主验收**：
-> - **离线统一测试**：MCP 服务已完成当前标准资源版本的代码实现与全套离线测试（`bun run test:mcp` 17 项测试 / 478 断言全过，耗时 13.69s；`bun run typecheck:mcp` 与 `bun run typecheck` 通过；隔离打包 168 模块 `mcp.js` 0.97 MB 通过）。整合测试验证了从 OAuth JWT 签名校验、MCP Streamable HTTP 协议、Bridge 任务调度、文件插件直到 ZIP 原件哈希比对的端到端闭包。
+> - **离线测试基线**：此前公网 OAuth 模式基线已完成离线测试（`bun run test:mcp` 17 项测试 / 478 断言全过，耗时 13.69s；隔离打包 168 模块 `mcp.js` 0.97 MB 通过）。本轮双模式本地测试 20 项 / 667 断言已通过，详见 [docs/VERIFICATION.md](VERIFICATION.md)；真实 Tunnel / ChatGPT 仍未测。
 > - **真实 OpenCode 宿主验收**：在隔离环境中通过真实 OpenCode 2.0.27 宿主二进制完成实测。宿主成功连接 MCP 服务，实际调用 `hermes_submit`（触发原生网关 POST 1 次、外部文件导入 1 次）、`hermes_status`、`hermes_result` 与重复 submit 幂等复用；随后在 Code Mode 下检索发现并调用 `tools.opencode.read_mcp_resource` 读取资源，返回的 Base64 blob 解码后 318 字节 ZIP 与源原件 SHA-256 哈希（`75e419f42626b40231569f6bbc57b05fa106815ce0e73dbe1c6587b8bc0468af`）完全一致。整个过程未生成 HTTP 能力链接，无自动本地落盘（`automaticFileSave: false`）。
 > - **资源读取与清理**：服务端实际处理 `readResource` 1 次，隔离宿主与运行夹具已关闭清理，生产服务及 `dist/` 未改动。
 > - **真实边界**：测试中上游 Gateway/model 与外部文件源采用本地仿真，宿主调用由脚本化 provider 驱动；真实 ChatGPT 网页端附件自动绑定与商业 OAuth 账户接入仍待实测。本轮 MCP 代码在本地验证完成，尚未在生产环境部署上线。

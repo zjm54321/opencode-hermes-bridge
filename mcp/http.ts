@@ -3,8 +3,8 @@ import { McpServer, ProtocolError, ProtocolErrorCode, ResourceNotFoundError, Res
 import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node'
 import { z } from 'zod'
 import { contentDisposition, hashBytes, LIMITS } from '../src/protocol.js'
-import { AuthenticationError, authChallenge, JwtAuthenticator, protectedResourceMetadata, type Principal } from './auth.js'
-import type { McpConfig } from './config.js'
+import { AuthenticationError, authChallenge, JwtAuthenticator, privateTunnelAuthority, protectedResourceMetadata, type Principal } from './auth.js'
+import { configuredPrincipal, type McpConfig } from './config.js'
 import { McpError, resourceIdentity, resourcePattern, resourceURI, type PublicResult } from './contracts.js'
 import type { McpBridgeService } from './service.js'
 
@@ -80,7 +80,10 @@ async function waitFor<T>(work: Promise<T>, signals: AbortSignal[]): Promise<T> 
   })
 }
 
-export function createMcpHttpServer(config: McpConfig, service: EdgeService, authenticator = new JwtAuthenticator(config)) {
+export function createMcpHttpServer(config: McpConfig, service: EdgeService, authenticator?: JwtAuthenticator) {
+  // No JWT verifier or remote JWKS resolver is constructed for the private trust domain.
+  const oauthAuthenticator = config.authMode === 'oauth' ? authenticator ?? new JwtAuthenticator(config) : undefined
+  const owner = configuredPrincipal(config)
   const allowedOrigins = new Set([config.publicOrigin, 'https://chatgpt.com'])
   const host = new URL(config.publicOrigin).host
   let requests = 0
@@ -157,7 +160,7 @@ export function createMcpHttpServer(config: McpConfig, service: EdgeService, aut
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     }, (input, ctx) => invoke(() => service.status(principal, input.job_id), ctx.mcpReq.signal))
     mcp.registerTool('hermes_result', {
-      description: 'Retrieve an existing Hermes result or wait up to 120 seconds. Files are MCP resource links: use authenticated resources/read for original binary blobs, not inline model text or proof a model read them.',
+      description: 'Retrieve an existing Hermes result or wait up to 120 seconds. Files are MCP resource links: use authorized resources/read for original binary blobs, not inline model text or proof a model read them.',
       inputSchema: z.object({ job_id: uuid, wait_seconds: wait }).strict(), outputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
     }, (input, ctx) => invoke(() => service.result(principal, input.job_id, input.wait_seconds), ctx.mcpReq.signal))
@@ -171,16 +174,22 @@ export function createMcpHttpServer(config: McpConfig, service: EdgeService, aut
     let mcp: McpServer | undefined
     let counted = false
     void (async () => {
-      if (header(req, 'host') !== host) throw new HTTPFailure(403)
       const origin = header(req, 'origin')
-      if (origin !== undefined && !allowedOrigins.has(origin)) throw new HTTPFailure(403)
+      if (config.authMode === 'private-tunnel') {
+        // Check the listener too: a wildcard bind is forbidden even when this connection is local.
+        const authority = privateTunnelAuthority(config, server.address(), req.socket)
+        if (!authority || header(req, 'host') !== authority || (origin !== undefined && origin !== `http://${authority}` && origin !== 'https://chatgpt.com')) throw new HTTPFailure(403)
+      } else {
+        if (header(req, 'host') !== host || (origin !== undefined && !allowedOrigins.has(origin))) throw new HTTPFailure(403)
+      }
       if (origin) { res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin') }
       res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff')
       if (requests >= MAX_REQUESTS) throw new HTTPFailure(503)
       requests++; counted = true
       const path = req.url ?? ''
+      if (config.authMode === 'private-tunnel' && (path === '/.well-known/oauth-protected-resource' || path.startsWith('/files/'))) throw new HTTPFailure(404)
       if (req.method === 'GET' && path === '/health') { json(res, 200, { ok: true }); return }
-      if (req.method === 'GET' && path === '/.well-known/oauth-protected-resource') { json(res, 200, protectedResourceMetadata(config)); return }
+      if (config.authMode === 'oauth' && req.method === 'GET' && path === '/.well-known/oauth-protected-resource') { json(res, 200, protectedResourceMetadata(config)); return }
       if (req.method === 'OPTIONS' && origin && (path === '/mcp' || fileRoute.test(path))) {
         res.writeHead(204, { 'Access-Control-Allow-Methods': path === '/mcp' ? 'POST' : 'GET', 'Access-Control-Allow-Headers': 'Authorization, Content-Type, Accept, MCP-Protocol-Version' }); res.end(); return
       }
@@ -199,7 +208,12 @@ export function createMcpHttpServer(config: McpConfig, service: EdgeService, aut
         res.end(download.bytes); return
       }
       if (path !== '/mcp') throw new HTTPFailure(404)
-      const principal = await waitFor(authenticator.authenticate(header(req, 'authorization')), [aborted.signal])
+      let principal: Principal
+      if (config.authMode === 'private-tunnel') principal = owner
+      else {
+        if (!oauthAuthenticator) throw new HTTPFailure(500)
+        principal = await waitFor(oauthAuthenticator.authenticate(header(req, 'authorization')), [aborted.signal])
+      }
       if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); throw new HTTPFailure(405) }
       const parsed = await body(req, aborted.signal)
       mcp = mcpServer(principal, aborted.signal, parsed)
@@ -210,7 +224,7 @@ export function createMcpHttpServer(config: McpConfig, service: EdgeService, aut
       if (res.destroyed || res.writableEnded) return
       if (res.headersSent) { res.destroy(); return }
       const status = error instanceof AuthenticationError || error instanceof HTTPFailure || error instanceof McpError ? error.status : 500
-      if (status === 401) res.setHeader('WWW-Authenticate', authChallenge(config))
+      if (status === 401 && config.authMode === 'oauth') res.setHeader('WWW-Authenticate', authChallenge(config))
       res.setHeader('Connection', 'close')
       json(res, status, error instanceof McpError ? { error: { code: error.code, message: error.message } }
         : { error: status === 401 ? 'Authentication required' : status === 403 ? 'Access denied' : 'Request refused' })

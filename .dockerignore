@@ -1,0 +1,13 @@
+# Allow only the locked MCP build inputs; never send dist, credentials or state.
+**
+!package.json
+!bun.lock
+!src/
+!src/**
+!mcp/
+!mcp/**
+!deploy/
+!deploy/private-tunnel/
+!deploy/private-tunnel/Dockerfile
+!deploy/private-tunnel/volume-init.mjs
+!deploy/private-tunnel/probe.mjs

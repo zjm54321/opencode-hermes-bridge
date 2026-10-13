@@ -5,20 +5,24 @@ import { join } from 'node:path'
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose'
 import type { CallToolResult, ListToolsResult } from '@modelcontextprotocol/server'
 import { JwtAuthenticator } from '../mcp/auth.js'
-import { mcpConfig } from '../mcp/config.js'
+import { configuredPrincipal, mcpConfig } from '../mcp/config.js'
 import type { PublicResult, SubmitInput } from '../mcp/contracts.js'
 import { createMcpHttpServer } from '../mcp/http.js'
 import { McpBridgeService, type McpBridgeOptions } from '../mcp/service.js'
 import { hashBytes } from '../src/protocol.js'
 import { withFixture } from './integration/harness.js'
 
-test('signed MCP → actual Bridge/GatewayRunner/file plugin → native ZIP resource survives restart with one run', async () => {
+for (const authMode of ['oauth', 'private-tunnel'] as const) {
+test(`${authMode} MCP → actual Bridge/GatewayRunner/file plugin → native ZIP resource survives restart with one run`, async () => {
   await withFixture(async h => {
     const original = await readFile(h.nativeZip)
     expect(original.subarray(0, 4)).toEqual(Buffer.from([0x50, 0x4b, 0x03, 0x04]))
     expect(original.includes(Buffer.from([0x00, 0xff, 0xfe]))).toBe(true)
     const digest = hashBytes(original)
     const config = mcpConfig({
+      HERMES_MCP_AUTH_MODE: authMode,
+      HERMES_MCP_PRIVATE_OWNER: 'native-private-fixture-owner',
+      HERMES_MCP_TUNNEL_ID: `tunnel_${'c'.repeat(32)}`,
       HERMES_MCP_PUBLIC_ORIGIN: 'https://mcp.example.test',
       HERMES_MCP_ISSUER: 'https://issuer.example.test/realm',
       HERMES_MCP_JWKS_URL: 'https://issuer.example.test/keys',
@@ -26,14 +30,19 @@ test('signed MCP → actual Bridge/GatewayRunner/file plugin → native ZIP reso
       HERMES_MCP_STATE_DIR: join(h.root, 'mcp-state'),
       HERMES_MCP_FILE_ORIGINS: '["https://files.example.test"]',
     })
-    const pair = await generateKeyPair('ES256')
-    const jwk = await exportJWK(pair.publicKey)
-    const authenticator = new JwtAuthenticator(config, createLocalJWKSet({ keys: [{ ...jwk, kid: 'native-fixture-key', alg: 'ES256' }] }))
-    const token = (subject = config.allowedSubject) => new SignJWT({
-      iss: config.issuer, sub: subject, aud: config.resource,
-      exp: Math.floor(Date.now() / 1000) + 300, scope: 'hermes:use',
-    }).setProtectedHeader({ alg: 'ES256', kid: 'native-fixture-key' }).sign(pair.privateKey)
-    const goodToken = await token()
+    let authenticator: JwtAuthenticator | undefined
+    let token: ((subject?: string) => Promise<string>) | undefined
+    if (config.authMode === 'oauth') {
+      const oauth = config
+      const pair = await generateKeyPair('ES256')
+      const jwk = await exportJWK(pair.publicKey)
+      authenticator = new JwtAuthenticator(oauth, createLocalJWKSet({ keys: [{ ...jwk, kid: 'native-fixture-key', alg: 'ES256' }] }))
+      token = (subject = oauth.allowedSubject) => new SignJWT({
+        iss: oauth.issuer, sub: subject, aud: oauth.resource,
+        exp: Math.floor(Date.now() / 1000) + 300, scope: 'hermes:use',
+      }).setProtectedHeader({ alg: 'ES256', kid: 'native-fixture-key' }).sign(pair.privateKey)
+    }
+    const goodToken = await token?.()
     const input: SubmitInput = {
       request_id: 'ba0299e6-84ba-4fe5-a0cc-2f0b4e0c31bf',
       text: 'Return the original ZIP through the file tools without extracting it.',
@@ -46,7 +55,7 @@ test('signed MCP → actual Bridge/GatewayRunner/file plugin → native ZIP reso
       bridgeConfig: { url: h.url, token: h.token, uploadRoots: [], directory: h.root,
         outputDir: join(h.root, 'mcp-outputs'), pollMs: 10, httpTimeoutMs: 2000, jobTimeoutMs: 30_000 },
       stateDirectory: config.stateDirectory, publicOrigin: config.publicOrigin,
-      allowedPrincipal: { issuer: config.issuer, subject: config.allowedSubject },
+      allowedPrincipal: configuredPrincipal(config),
       // The sole file-boundary substitution: platform HTTPS reference retrieval.
       // SSRF/TLS/DNS enforcement belongs to edge tests; no ChatGPT binding claim.
       downloadFile: async ref => {
@@ -73,7 +82,7 @@ test('signed MCP → actual Bridge/GatewayRunner/file plugin → native ZIP reso
               // No TLS bypass or localhost allowance is added to production code.
               const req = httpRequest({ host: '127.0.0.1', port: address.port, path,
                 method: options.method ?? 'GET', agent: false,
-                headers: { Host: new URL(config.publicOrigin).host, ...options.headers },
+                headers: { Host: config.authMode === 'private-tunnel' ? `127.0.0.1:${address.port}` : new URL(config.publicOrigin).host, ...options.headers },
               }, res => {
                 const chunks: Buffer[] = []
                 res.on('data', chunk => chunks.push(Buffer.from(chunk)))
@@ -106,7 +115,7 @@ test('signed MCP → actual Bridge/GatewayRunner/file plugin → native ZIP reso
     }
     let edge = await start(), id = 0
     const rpc = (method: string, params?: unknown, bearer = goodToken) => edge.request('/mcp', {
-      method: 'POST', headers: { Authorization: `Bearer ${bearer}`, Accept: 'application/json, text/event-stream',
+      method: 'POST', headers: { ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}), Accept: 'application/json, text/event-stream',
         'Content-Type': 'application/json', 'MCP-Protocol-Version': '2025-11-25' },
       body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, ...(params === undefined ? {} : { params }) }),
     })
@@ -144,7 +153,7 @@ test('signed MCP → actual Bridge/GatewayRunner/file plugin → native ZIP reso
       expect(file.expires_at).toBeUndefined()
       expect(submitted.result.content).toContainEqual({ type: 'resource_link', uri: file.uri, name: file.name, mimeType: file.mime, size: file.size })
       expect(submitted.result.content.every(part => part.type === 'text' || part.type === 'resource_link')).toBe(true)
-      for (const forbidden of [h.root, '"path"', h.url, h.token, input.file!.download_url, 'signature=first', original.toString('base64'), 'data:application/zip']) {
+      for (const forbidden of [h.root, '"path"', h.url, h.token, input.file!.download_url, 'signature=first', original.toString('base64'), 'data:application/zip', 'private-tunnel.invalid']) {
         expect(submitted.response.text).not.toContain(forbidden)
       }
       const publicStatus = await call('hermes_status', { job_id: submitted.dto.job_id })
@@ -188,8 +197,10 @@ test('signed MCP → actual Bridge/GatewayRunner/file plugin → native ZIP reso
       const freshDownloaded = await rpc('resources/read', { uri: renewed.dto.files![0]!.uri })
       expect(freshDownloaded.status).toBe(200)
       expect(JSON.parse(freshDownloaded.text).result.contents).toEqual(contents)
-      const denied = await rpc('resources/read', { uri: file.uri }, await token('wrong-subject'))
-      expect(denied.status).toBe(403)
+      if (token) {
+        const denied = await rpc('resources/read', { uri: file.uri }, await token('wrong-subject'))
+        expect(denied.status).toBe(403)
+      }
       const repeated = await h.nativeStats()
       expect(repeated.native_posts).toBe(1)
       expect(repeated.native_job_ids).toEqual([submitted.dto.job_id])
@@ -199,7 +210,8 @@ test('signed MCP → actual Bridge/GatewayRunner/file plugin → native ZIP reso
       expect(imports).toBe(1)
       const persisted = await readFile(join(config.stateDirectory, 'state.json'), 'utf8')
       expect(JSON.parse(persisted).capabilities).toEqual({})
-      for (const forbidden of [h.token, goodToken, 'signature=first', 'signature=refreshed', 'download_url']) expect(persisted).not.toContain(forbidden)
+      for (const forbidden of [h.token, ...(goodToken ? [goodToken] : []), 'signature=first', 'signature=refreshed', 'download_url']) expect(persisted).not.toContain(forbidden)
     } finally { await edge.close() }
   }, { nativeFiles: true })
 }, 30_000)
+}

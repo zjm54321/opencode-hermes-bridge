@@ -259,13 +259,13 @@ Python 服务端测试套件包含 29 个测试项（耗时 8.430s 无 skip，�
    - 遵循单 Owner 原则绑定个人原 Hermes 记忆与 profile，独立私有状态目录（`state.json` 0600，`writer.lock` 单写者排他锁且异常不偷锁）。
 2. **测试状态与全套离线验证证据**（执行 `nix develop --offline --no-update-lock-file`）：
    - **类型检查**：`bun run typecheck` 与 `bun run typecheck:mcp` 全数通过（0 错误）；
-   - **MCP 测试套件**：`bun run test:mcp` 通过 17 项测试与 478 个断言（耗时 13.69s，0 失败；涵盖 12 项核心状态机测试、3 项边缘 HTTP/OAuth 测试、1 项原生 resources 测试及 1 项端到端整合测试）；
-   - **整合链路验证**：整合测试真实覆盖了 OAuth JWT 签名校验 -> 官方 MCP Streamable HTTP 协议交互 -> 真实 Bridge / Companion / GatewayRunner 任务流转 -> 真实 `hermes_file_plugin` 插件调度 -> 原生 `resources/read` 获取 `blob` 原始字节及 ZIP 原件 SHA-256 哈希比对闭环（测试中外部平台文件下载与上游 Gateway/model 运行时采用离线仿真）；
-   - **隔离打包验证**：隔离 Bun build 编译通过（168 modules，打包产物 `mcp.js` 0.97 MB），线上 `dist/` 目录哈希保持不变；
-   - **代码风格与空白校验**：`git diff --check` 全数通过；Python 后端与 `hermes_file_plugin` 源码自上轮提交 `f4503dd` 以来未变，沿用上轮 43 项 Python 测试通过证据；
-   - **真实 OpenCode 宿主验收证据**：在隔离环境中通过真实 OpenCode 2.0.27 宿主二进制完成实测闭环。宿主成功连接 MCP 服务，实际调用 `hermes_submit`（触发原生网关 POST 1 次、外部文件导入 1 次）、`hermes_status`、`hermes_result` 与重复 submit 幂等复用；随后在 Code Mode 下检索发现并调用 `tools.opencode.read_mcp_resource({server, uri})` 读取资源，返回的 Base64 blob 解码后 318 字节 ZIP 与源原件 SHA-256 哈希（`75e419f42626b40231569f6bbc57b05fa106815ce0e73dbe1c6587b8bc0468af`）完全一致。整个过程未生成 HTTP 能力链接，无自动本地落盘（`automaticFileSave: false`）。
-   - **资源读取与清理**：服务端实际处理 `readResource` 1 次，未通过独立 HTTP 下载接口取件。隔离宿主退出、运行夹具清理完成，生产服务及 `dist/` 未改动。
-   - **真实外部环境边界**：测试中上游 Gateway/model 与外部文件源采用本地仿真，宿主调用由脚本化 provider 驱动；真实 ChatGPT 网页端附件自动绑定、原生文件卡片呈现及商业 OAuth 真实账户接入仍待实测。本轮 MCP 代码在本地验证完成，未部署生产。
+   - **MCP 测试套件**：`bun run test:mcp` 通过 20 项测试与 667 个断言（耗时 14.30s，0 失败；涵盖核心状态机、边缘 HTTP/OAuth、原生 resources，以及新增的 3 项私有隧道场景：回环/Host/Origin/通配拒绝与无元数据 404、固定 Owner/Tunnel 变更拒绝与幂等复用、双模式下真实本地 Bridge/GatewayRunner/file_plugin ZIP 往返且模型 POST 仅 1 次）；
+   - **部署模板静态与仿真检查**：`deploy/private-tunnel/` 模板通过 3 项 Python 检查器夹具（已对齐 `assets: true` 门禁键）、1 项非特权卷初始化夹具（20 断言；仅验证目录及绑定逻辑，未验证真实 root→10000 权限切换或 CSI/PV 行为），Kustomize 5.8.1 成功渲染 6 项基础资源；结构检查 PASS 不等于生产就绪，默认 release 检查因占位符预期 exit 1；
+   - **打包产物私有模式启动与协议实测**：直接加载编译产物 bundle（`/tmp/opencode/private-tunnel-build-hDvg2S/index.js`），在临时回环端口调用其实际 `startMcp`；在未提供 Bearer 凭据下执行 MCP `initialize` 成功返回 HTTP 200；`/.well-known/oauth-protected-resource` 返回预期 404 且无 `WWW-Authenticate` 头部；仿真后端计数确认上游 HTTP 调用为 0；关闭监听并清理临时状态通过（注：此项验证 bundle 运行逻辑，非 Docker / 真实 Tunnel / ChatGPT 测试）；
+   - **能力字段与后端边界**：当前源码通过 `assets` 布尔字段声明资产通道；完整文件发布需实测确认 `assets: true`（非 `files: true`），但这仍不等于模型成功调用插件；当前生产环境仍运行旧版文本+图片 Sidecar 基线；
+   - **隔离打包验证**：隔离 Bun build 编译通过（168 modules，打包产物 `mcp.js` 0.97 MB），线上 `dist/` 目录哈希保持不变（`dist/core.js` 为 `3ff7998e...`，`dist/index.js` 为 `e9280f81...`）；代码风格与空白校验（`git diff --check`）全数通过；Python 后端与 `hermes_file_plugin` 源码自上轮提交 `f4503dd` 以来未变，沿用上轮 43 项 Python 测试通过证据；
+   - **真实 OpenCode 宿主验收证据（OAuth 基线）**：此前在隔离环境中通过真实 OpenCode 2.0.27 宿主二进制完成实测闭环（实际调用 `hermes_submit`、`hermes_status`、`hermes_result` 与 `read_mcp_resource` 验证 318 字节 ZIP 闭环，SHA-256 为 `75e419f42626b40231569f6bbc57b05fa106815ce0e73dbe1c6587b8bc0468af`，无自动落盘）。该项仅为此前公网 OAuth 基线证据，未在私有隧道模式下重跑真实 Host，不混同于 ChatGPT 隧道实测；
+   - **真实外部环境边界**：测试中上游 Gateway/model 与外部文件源采用本地仿真，宿主调用由脚本化 provider 驱动；真实 ChatGPT 网页端附件自动绑定、原生文件卡片呈现及 OpenAI 控制面真实 Tunnel 联调仍待实测。本轮 MCP 代码在本地验证完成，尚未提交代码，未部署生产。
 
 ---
 

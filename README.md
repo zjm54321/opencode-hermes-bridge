@@ -303,6 +303,10 @@ python -m hermes_bridge.init \
 
 ## 10. ChatGPT Remote MCP 服务（本地实现与宿主验证完成，未部署）
 
-项目在 `mcp/` 目录提供了面向 ChatGPT 网页端（Business / Enterprise）的标准 Streamable HTTP `/mcp` 服务（启动脚本 `bun run mcp:start`），基于官方 MCP SDK 构建并受独立 OAuth 2.0 保护，支持 `hermes_submit`、`hermes_status`、`hermes_result` 三项工具与原生 Resources 原字节文件交付。本地离线已完成全套验证（`bun run test:mcp` 17 项测试 / 478 断言及类型检查全部通过），并在真实隔离 OpenCode 2.0.27 宿主中实际调用 MCP 三工具与 Code Mode `read_mcp_resource` 验证了 318 字节 ZIP 原件完整闭环（哈希一致，向仿真原生网关 POST 1 次，无自动落盘）。详细架构设计、配置变量与安全契约请参考专门文档 [docs/CHATGPT_MCP.md](docs/CHATGPT_MCP.md)。
+项目在 `mcp/` 目录提供了面向 ChatGPT 网页端（Business / Enterprise）的标准 Streamable HTTP `/mcp` 服务（启动脚本 `bun run mcp:start`），基于官方 MCP SDK 构建，支持 `hermes_submit`、`hermes_status`、`hermes_result` 三项工具与原生 Resources 原字节文件交付。本轮已完成本地全套离线验证（`bun run test:mcp` 20 项测试 / 667 断言及 MCP 类型检查全部通过），并在真实隔离 OpenCode 2.0.27 宿主中（OAuth 基线）实际调用 MCP 三工具与 Code Mode `read_mcp_resource` 验证了 318 字节 ZIP 原件完整闭环（哈希一致，向仿真原生网关 POST 1 次，无自动落盘）。针对私有隧道的离线部署模板（`deploy/private-tunnel/`）已完成结构与静态检查。
 
-> **说明**：该服务目前已完成源码实现与真实宿主离线闭环，尚未在真实 ChatGPT 账户或生产环境连接部署；实际接入使用需外部配置域名证书、真实 OAuth 授权服务器并取得工作区管理权限。
+针对接入网络与认证方式，项目支持两种模式：
+- **公网 OAuth 模式**：通过外部标准 OAuth 授权服务器与公网 HTTPS 反向代理保护，详见 [docs/CHATGPT_MCP.md](docs/CHATGPT_MCP.md)；
+- **官方私有隧道模式（推荐个人免 IdP 使用）**：通过 OpenAI 官方 Secure MCP Tunnel（`openai/tunnel-client`）建立私有出站直连（选 Tunnel + No authentication），无需外部 IdP 或开放公网端口，详见 [docs/PRIVATE_TUNNEL.md](docs/PRIVATE_TUNNEL.md)。
+
+> **说明**：该服务目前已完成源码实现与真实宿主离线闭环，尚未在真实 ChatGPT 账户或生产环境连接部署；实际接入使用需工作区管理权限及对应凭据准备。

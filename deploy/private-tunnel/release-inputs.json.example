@@ -1,0 +1,20 @@
+{
+  "scope": "",
+  "bunImage": "",
+  "mcpImage": "",
+  "sourceRevision": "",
+  "confirmations": {
+    "image_build_and_digest_verified": {"confirmed": false, "evidence": ""},
+    "dedicated_pvc_backup_and_binding_verified": {"confirmed": false, "evidence": ""},
+    "volume_init_on_target_storage_verified": {"confirmed": false, "evidence": ""},
+    "cni_dns_backend_egress_and_existing_rules_verified": {"confirmed": false, "evidence": ""},
+    "secrets_provisioned_out_of_band": {"confirmed": false, "evidence": ""},
+    "owner_tunnel_account_permissions_verified": {"confirmed": false, "evidence": ""},
+    "existing_hermes_identity_preserved": {"confirmed": false, "evidence": ""},
+    "chatgpt_text_acceptance_verified": {"confirmed": false, "evidence": ""},
+    "profile_safe_backend_plugin_upgrade_verified": {"confirmed": false, "evidence": ""},
+    "backend_capabilities_assets_true": {"confirmed": false, "evidence": ""},
+    "chatgpt_original_file_roundtrip_verified": {"confirmed": false, "evidence": ""},
+    "file_origins_verified": {"confirmed": false, "evidence": ""}
+  }
+}

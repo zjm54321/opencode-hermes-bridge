@@ -1,5 +1,5 @@
 import { Plugin } from '@opencode/plugin'
-import { Bridge, config } from './core.js'
+import { Bridge, config, waitSeconds } from './core.js'
 import { record, uuid } from './protocol.js'
 
 const attachmentSchema = {
@@ -12,6 +12,15 @@ const attachmentSchema = {
     base64: { type: 'string', description: 'Canonical base64 bytes, not a URL.' },
   },
 } as const
+const fileSchema = {
+  ...attachmentSchema,
+  properties: {
+    ...attachmentSchema.properties,
+    mime: { type: 'string', description: 'Lowercase MIME type without parameters, including application/pdf, application/zip or application/octet-stream. Required for path/base64.' },
+    path: { type: 'string', description: 'Local file in explicitly configured uploadRoots. Symlinks and remote URLs are forbidden; opaque bytes are snapshotted without parsing.' },
+  },
+} as const
+const waitSchema = { type: 'number', minimum: 0, maximum: 120, description: 'Bounded wait in seconds (0 returns immediately). Cancellation stops waiting, not the persisted job.' } as const
 
 export default Plugin.define({
   id: 'hermes-bridge',
@@ -29,8 +38,6 @@ export default Plugin.define({
           },
           save: value => ctx.storage.set('outbox-v1', value),
         },
-        // Session IDs originate exclusively in tool context and are preserved in the private outbox.
-        prompt: input => ctx.session.prompt({ ...input, sessionID: input.sessionID as Parameters<typeof ctx.session.prompt>[0]['sessionID'] }),
       })
     } catch (error) {
       configurationError = error instanceof Error ? error.message : 'Hermes bridge setup failed'
@@ -39,13 +46,25 @@ export default Plugin.define({
     const registration = await ctx.tool.transform(editor => {
       editor.add({
         name: 'hermes_ask',
-        description: 'Send text and optional PNG/JPEG/GIF/WebP images to the configured Hermes companion; ordinary files are rejected. Snapshots only explicitly allowed local uploads, persists an outbox and immediately returns LOCAL acceptance, not a Hermes/model result. Background replies go only to this OpenCode session. External data leaves this machine if the configured endpoint is remote.',
+        description: 'Send text, optional native image attachments, and opaque files to Hermes. File transfer requires companion capabilities; files are never silently dropped or converted to text. Set requireFiles for output files even without input files. Up to 8 inputs total, 10 MiB each/20 MiB combined. Persist the job and wait up to 30 seconds by default (waitSeconds 0..120); return formal output or non-final status/job ID for hermes_result. No chat injection. Data leaves this machine if the endpoint is remote.',
         options: { permission: 'hermes_ask' },
-        input: { type: 'object', additionalProperties: false, required: ['text'], properties: { text: { type: 'string', description: 'Request to Hermes, at most 64 KiB UTF-8.' }, attachments: { type: 'array', maxItems: 8, items: attachmentSchema } } },
+        input: { type: 'object', additionalProperties: false, required: ['text'], properties: { text: { type: 'string', description: 'Request to Hermes, at most 64 KiB UTF-8.' }, attachments: { type: 'array', maxItems: 8, items: attachmentSchema, description: 'Native PNG/JPEG/GIF/WebP images only. Use files for ordinary binary files.' }, files: { type: 'array', maxItems: 8, items: fileSchema }, requireFiles: { type: 'boolean', description: 'Require file-capable execution, including when requesting output files with no input file. Unsupported companions fail before model submission.' }, waitSeconds: waitSchema } },
         async execute(input, context) {
           if (!bridge) return unavailable()
+          const seconds = waitSeconds(record(input).waitSeconds, 30)
           const job = await bridge.ask(context.sessionID, input, context.signal)
-          return { content: `Locally accepted and durably queued; not yet acknowledged by Hermes. Job ${job.id}; thread ${job.threadId}. Background result will be queued to this session. Use hermes_status with this job ID.` }
+          return bridge.result(context.sessionID, job.id, { waitSeconds: seconds, signal: context.signal })
+        },
+      })
+      editor.add({
+        name: 'hermes_result',
+        description: 'Read this session’s durable Hermes result as a formal tool result, optionally waiting up to 120 seconds (default 0). Pending/paused jobs return explicit non-final status. Images/text may be attached; other files are saved locally, not claimed as model-read. No chat injection or resubmission.',
+        options: { permission: 'hermes_result' },
+        input: { type: 'object', additionalProperties: false, required: ['id'], properties: { id: { type: 'string', description: 'Existing job UUID in this session.' }, waitSeconds: waitSchema } },
+        async execute(input, context) {
+          if (!bridge) return unavailable()
+          const r = record(input)
+          return bridge.result(context.sessionID, uuid(r.id), { waitSeconds: waitSeconds(r.waitSeconds), signal: context.signal })
         },
       })
       editor.add({
@@ -68,7 +87,8 @@ export default Plugin.define({
         async execute(input, context) {
           if (!bridge) return unavailable()
           const r = record(input)
-          return { content: JSON.stringify(await bridge.resume(context.sessionID, uuid(r.id), context.signal)) }
+          const job = await bridge.resume(context.sessionID, uuid(r.id), context.signal)
+          return { content: `${JSON.stringify(job)}\nUse hermes_result with this job ID to retrieve output. Resume never submits another POST.` }
         },
       })
     })

@@ -1,4 +1,4 @@
-import { config, type Clock, type JobResponse, type Prompt, type Storage } from '../../src/core.js'
+import { config, type Clock, type JobResponse, type Storage } from '../../src/core.js'
 
 export class MemoryStorage implements Storage {
   value?: string
@@ -22,13 +22,13 @@ export class FakeClock implements Clock {
   }
 }
 export function cfg() { return config({}, { HERMES_BRIDGE_TOKEN: 'test-secret' }, '/tmp/opencode') }
-export function fetchMock(handler: (url: string, init: RequestInit) => Promise<Response> | Response): typeof globalThis.fetch {
-  return Object.assign((input: string | URL | Request, init?: RequestInit) => Promise.resolve(handler(String(input), init ?? {})), { preconnect: () => {} })
+export function fetchMock(handler: (url: string, init: RequestInit) => Promise<Response> | Response, options: { capabilities?: boolean } = {}): typeof globalThis.fetch {
+  // Existing cases model a legacy companion. File-protocol cases opt into explicit capability handling.
+  return Object.assign((input: string | URL | Request, init?: RequestInit) => {
+    if (!options.capabilities && new URL(String(input)).pathname === '/v1/capabilities') return Promise.resolve(new Response(null, { status: 404 }))
+    return Promise.resolve(handler(String(input), init ?? {}))
+  }, { preconnect: () => {} })
 }
 export function complete(id: string, changes: Partial<JobResponse> = {}): JobResponse {
   return { id, status: 'completed', text: 'Hermes reply', attachments: [], error: null, ...changes }
-}
-export function collector() {
-  const prompts: Prompt[] = []
-  return { prompts, prompt: async (p: Prompt) => { prompts.push(p) } }
 }

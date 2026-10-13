@@ -190,9 +190,14 @@ class GatewayRunner:
 
     def run(self, request: RunInput) -> RunResult:
         session_id = "opencode-" + request.thread_id
-        native_input: Any = request.text
+        text = request.text
+        if request.input_assets is not None:
+            text += ("\n\nTask files: call bridge_files to obtain this run's controlled workspace and input files. "
+                     "For deliverable files, call bridge_publish_file after writing them there. "
+                     "Files are opaque bytes; do not assume ZIP contents should be executed.")
+        native_input: Any = text
         if request.attachments:
-            parts = [{"type": "text", "text": request.text}]
+            parts = [{"type": "text", "text": text}]
             parts.extend({"type": "image_url", "image_url": {
                 "url": f"data:{item['mime']};base64,{item['base64']}"}} for item in request.attachments)
             native_input = [{"role": "user", "content": parts}]
@@ -252,7 +257,8 @@ class GatewayRunner:
                         raise BridgeError("invalid_result", "Gateway returned an invalid result.", 502)
                     if not isinstance(value.get("output"), str):
                         raise BridgeError("invalid_result", "Gateway returned an invalid result.", 502)
-                    if re.search(r"\bMEDIA:", value["output"], re.IGNORECASE):
+                    if (re.search(r"\bMEDIA:", value["output"], re.IGNORECASE)
+                            and not (request.input_assets is not None and request.checkpoint.has_output_assets())):
                         raise BridgeError("unsupported_output", "Gateway file output is not supported.", 502)
                     return RunResult(value["output"])
                 delay = self.poll_interval

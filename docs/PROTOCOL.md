@@ -22,17 +22,38 @@
 ## 2. HTTP 接口规范
 
 - **默认监听地址**：`http://127.0.0.1:8787`。远程 HTTP 需要受信网络访问控制；若桥接服务限制仅在局域网（LAN）授权网段内暴露，建议在容器 NetworkPolicy 与宿主机 ACL 两层实施双重源地址控制；上游 SNAT 可能掩盖真实来源，须核实服务器实际观察到的源地址（通用示例网段可参考 `192.168.1.0/24` 与 `192.168.10.0/24`），严禁直接暴露于公网；不可信网络建议前置 TLS 反向代理或加密隧道。
-- **传输层鉴权**：请求必须携带 `Authorization: Bearer <TOKEN>` 头部。Token 必须为非空 ASCII 字符串，且不得包含空白字符或控制字符。服务端使用常量时间比对（`hmac.compare_digest`）校验。
-- **传输报文限制**：单次 HTTP 请求与响应体上限均为 32 MiB（`Content-Length` 超过 32 MiB 拒绝）。
+- **传输层鉴权**：
+  - 公开接口：请求必须携带 `Authorization: Bearer <HERMES_BRIDGE_TOKEN>` 头部；
+  - 内部文件接口（`/internal/...`）：仅限环回地址访问，必须携带 `Authorization: Bearer <HERMES_BRIDGE_FILE_TOKEN>` 头部，且两类 Token 完全独立。
+- **传输报文限制**：单次 HTTP 任务报文上限为 32 MiB（`Content-Length` 超过 32 MiB 拒绝）；单文件资产上限 10 MiB，单任务单向资产总上限 20 MiB。
 
-### 2.1 任务提交：`POST /v1/jobs`
+### 2.1 能力探测：`GET /v1/capabilities`
+
+客户端在首次准备提交任务时惰性调用此接口探测 Companion 服务端具备的特性与配额，并进行实例级缓存：
+
+- **请求头**：`Authorization: Bearer <HERMES_BRIDGE_TOKEN>`（或公开鉴权）
+- **响应状态码**：`200 OK`
+- **响应体 JSON 格式**：
+```json
+{
+  "object": "hermes.bridge.capabilities",
+  "version": 1,
+  "assets": true,
+  "max_asset_bytes": 10485760,
+  "max_total_asset_bytes": 20971520,
+  "max_assets": 8
+}
+```
+> **注意**：`assets: true` 仅代表 Bridge 服务端已配置并启用了文件资产接口，并不代表 Hermes 实例已安装或激活了对应的文件插件。
+
+### 2.2 任务提交：`POST /v1/jobs`
 
 客户端向 Companion 提交异步任务。服务端在返回响应前**必须先将规范化的数据写入 SQLite 并绑定网关 scope**。
 
 - **请求头**：
   - `Content-Type: application/json; charset=utf-8`
   - `Content-Length: <bytes>`
-  - `Authorization: Bearer <TOKEN>`
+  - `Authorization: Bearer <HERMES_BRIDGE_TOKEN>`
 
 - **请求体 JSON 格式**：
 ```json
@@ -46,31 +67,26 @@
       "mime": "image/png",
       "base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNiAAAABgADNjd8qAAAAABJRU5ErkJggg=="
     }
+  ],
+  "input_assets": [
+    "9f8b2c14-5717-4562-b3fc-2c963f66afa6"
   ]
 }
 ```
 
+- **字段说明**：
+  - `attachments`：仅支持原生内联图片（PNG/JPEG/GIF/WebP）；
+  - `input_assets`（可选，`[UUID]`）：已提前上传至资产库的文件资产 ID 列表。存在该字段（包括空列表 `[]`）即代表任务显式启用文件流转模式，并参与任务内容 SHA-256 指纹计算。
 - **响应状态码**：
   - `202 Accepted`：任务入库成功，返回 `{"id": "<uuid>"}`。
   - `409 Conflict`：请求的 Job ID 已存在，但内容哈希与既有任务不一致。
   - `413 Payload Too Large`：请求体整体、指令文本或附件体积超出配额。
   - `401 Unauthorized`：Bearer Token 缺失、错误或格式非法。
-  - `415 Unsupported Media Type`：`Content-Type` 不是 `application/json`，或附件包含非图片格式（返回 `unsupported_attachment`，仅支持 PNG/JPEG/GIF/WebP）。
+  - `415 Unsupported Media Type`：`Content-Type` 非 JSON，或传入非图片 attachment，或在服务端未启用文件能力时提交了 `input_assets`。
 
-- **幂等性判定**：
-  - 服务端提取除去 `id` 以外的规范字段（`threadId`、`text`、`attachments`）并计算 SHA-256 指纹。
-  - 若 `id` 相同且指纹一致，服务端幂等复用，一律返回 `202 {"id": "<id>"}`；
-  - 若 `id` 相同但指纹不一致，服务端返回 `409 Conflict`。
-
-### 2.2 任务状态轮询：`GET /v1/jobs/:id`
+### 2.3 任务状态轮询：`GET /v1/jobs/:id`
 
 - **请求格式**：`GET /v1/jobs/<uuid>`（严禁带查询参数）。
-
-- **响应状态码**：
-  - `200 OK`：返回任务最新快照。
-  - `404 Not Found`：未找到对应 Job ID。
-  - `401 Unauthorized`：Bearer Token 校验失败。
-
 - **响应体 JSON 格式**：
 ```json
 {
@@ -78,14 +94,46 @@
   "status": "queued | running | completed | failed",
   "text": "执行输出结果文本",
   "attachments": [],
+  "output_assets": [
+    {
+      "asset_id": "8a7c1b2d-5717-4562-b3fc-2c963f66afa6",
+      "name": "result.zip",
+      "mime": "application/zip",
+      "size": 1048576,
+      "sha256": "<64hex_sha256_hash>"
+    }
+  ],
   "error": null
 }
 ```
 
 - **字段约束与状态转移**：
-  - 未就绪状态（`status` 为 `queued` 或 `running`）：`text` 为 `""`，`attachments` 为 `[]`，`error` 为 `null`。
-  - 执行成功（`status` 为 `completed`）：`text` 包含网关生成的回复文本，`attachments` 为 `[]`（当前原生网关不包含输出附件传输契约，此为生产 Gateway 任务正常结果示例；v1 wire 协议保留输出附件数组结构以兼容历史产物与本地回显适配器，但系统不开放普通文件新输入），`error` 为 `null`。
-  - 执行失败（`status` 为 `failed`）：`text` 为 `""`，`attachments` 为 `[]`，`error` 为 `{"code": "ERR_CODE", "message": "脱敏错误描述"}`。若模型输出中出现 `MEDIA:...` 格式，置为 `failed` 且错误码为 `unsupported_output`（客户端 GET 接口恒返回 HTTP 200）。
+  - 未就绪状态（`queued` / `running`）：`text` 为 `""`，`attachments` 为 `[]`，`output_assets` 为 `[]`，`error` 为 `null`。
+  - 执行成功（`completed`）：`text` 包含模型生成的回复文本，`attachments` 兼容既有内联图片，`output_assets`（可选扩展字段，旧格式可省略）包含 Hermes 发布的常规产物文件元数据，`error` 为 `null`。
+  - 执行失败（`failed`）：`text` 为 `""`，`attachments` 与 `output_assets` 为 `[]`，`error` 为 `{"code": "ERR_CODE", "message": "脱敏描述"}`。若模型输出中出现未受支持的 `MEDIA:...` 格式文本且无已登记输出资产，置为 `failed` 且错误码为 `unsupported_output`；若已有登记发布的输出资产，文本严格作为普通文本，绝不额外解析文本内的 `MEDIA:` 路径。
+
+### 2.4 公开文件资产接口：`PUT / GET /v1/jobs/:job_id/assets/:asset_id`
+
+- **传输层鉴权**：携带 `Authorization: Bearer <HERMES_BRIDGE_TOKEN>`。
+- **上传资产：`PUT /v1/jobs/:job_id/assets/:asset_id`**：
+  - 允许在 `POST /v1/jobs` 提交任务之前上传输入资产；一旦任务提交成功，输入资产名单即被密封冻结（sealed），后续仅允许对已密封的资产 ID 按相同字节与哈希原样幂等重传（PUT 返回 `200 OK`），提交后严禁追加新资产；
+  - 请求头必须包含：
+    - `Content-Type: <mime>`
+    - `Content-Length: <bytes>`
+    - `Content-Disposition: attachment; filename*=UTF-8''<url_encoded_basename>`
+    - `X-Content-SHA256: <64hex>`
+  - 响应：新资产写入返回 `201 Created`；相同 ID 且内容哈希一致幂等返回 `200 OK`；相同 ID 但字节内容不一致返回 `409 Conflict`。
+  - 文件 PUT 幂等重传不等于模型任务 POST 可重放（模型任务 POST 严格遵循至多 1 次提交）。
+- **下载资产：`GET /v1/jobs/:job_id/assets/:asset_id`**：
+  - 以二进制流返回资产内容；客户端核验流式 SHA-256 与元数据一致后，再原子写入本地目标路径，绝不覆盖内容相异的既有文件。
+
+### 2.5 内部文件资产接口（环回专属）：`/internal/runs/:run_id/assets[/:asset_id]`
+
+供本地 Hermes 插件（`hermes_file_plugin`）调用的专用接口：
+- **运行约束**：仅允许本地环回请求（Loopback），必须携带 `Authorization: Bearer <HERMES_BRIDGE_FILE_TOKEN>`。
+- **获取输入列表：`GET /internal/runs/:run_id/assets`**：返回 `{"job_id": "<uuid>", "input_assets": [<Asset>, ...]}`。
+- **读取输入资产原字节：`GET /internal/runs/:run_id/assets/:asset_id`**：流式返回输入资产二进制。
+- **发布输出资产：`PUT /internal/runs/:run_id/assets/:asset_id`**：将当前 run 工作区内的生成文件登记发布为任务资产，返回元数据。返回 `201 Created` 或幂等 `200 OK`。
 
 ---
 
@@ -149,34 +197,41 @@
 | 配额项 | 约束阈值 | 超限处理机制 |
 | :--- | :--- | :--- |
 | 指令文本 (`text`) | 最大 64 KiB UTF-8 | 客户端阻止 / 服务端 HTTP 413 |
-| 附件数量 (`attachments`) | 最多 8 个（仅限 PNG/JPEG/GIF/WebP 图片） | 客户端阻止 / 服务端 HTTP 415（非法类型）或 413 |
-| 单附件体积 | 解码后最大 10 MiB | 客户端阻止 / 服务端 HTTP 413 |
-| 附件总体积 | 解码后最大 20 MiB | 客户端阻止 / 服务端 HTTP 413 |
-| 附件名称 (`name`) | 纯单文件名，最大 255 字节，禁止路径分隔符及控制字符 | HTTP 400 拒绝 |
-| HTTP 报文体积 | 最大 32 MiB | HTTP 413 拒绝 |
+| 单文件资产体积 (`max_asset_bytes`) | 最大 10 MiB (10,485,760 字节) | 服务端 HTTP 413 拒绝 |
+| 输入项合计 (`attachments` + `files` / `input_assets`) | 最多 8 项，单向总体积最大 20 MiB | 客户端阻止 / 服务端 HTTP 413 或 415 |
+| 输出项合计 (内联图片 + `output_assets`) | 最多 8 项，单向总体积最大 20 MiB | 服务端截断保护 / 超限置为 `failed` |
+| 附件与资产名称 (`name`) | 纯单文件名，最大 255 字节，禁止路径分隔符及控制字符 | HTTP 400 拒绝 |
+| HTTP 任务报文体积 | 最大 32 MiB | HTTP 413 拒绝 |
 | 原生 Gateway 报文 (`MAX_NATIVE_BODY`) | 最大 10,000,000 字节 | 超出硬上限在提交网关前置为 `failed`（错误码 `payload_too_large`） |
 
-> **载荷分层约束说明**：
-> 外部 HTTP 接口（`POST /v1/jobs`）遵循 32 MiB 请求体及单文件 10 MiB / 总计 20 MiB 配额。然而，Companion 组装发往 Gateway 原生接口的规范 JSON 报文设有 10,000,000 字节（`MAX_NATIVE_BODY`）硬上限；由于 Base64 膨胀（~33%）及 JSON 封装开销，实际允许传输的图片总容量显著受限；入队 202 成功不保证原生报文体一定通过检查，超出硬上限将在发送前失败。
+> **载荷与配额聚合说明**：
+> - 配额按输入与输出两个方向分别独立聚合：输入方向 `attachments` 与 `files` 合计不超过 8 项、总计不超过 20 MiB；输出方向既有内联图片与 `output_assets` 合计不超过 8 项、总计不超过 20 MiB（并非图片 8 项再文件 8 项，亦非双向总共 8 项）。
+> - 发往 Gateway 原生接口的规范 JSON 报文设有 10,000,000 字节（`MAX_NATIVE_BODY`）硬上限；普通文件通过资产层直传，不计入 Gateway JSON 报文；若图片或文本原生报文超出该硬上限，将在发送前失败。
 
 ---
 
 ## 5. 客户端（TypeScript 插件）行为准则
 
-1. **Outbox 存储模型与写前持久化**：
-   - 调用 `hermes_ask` 时，先校验图片 MIME，并将指令、图片数据、`postAttempted: false` 及当前 `scopeHash` 写入本地持久化存储（`outbox-v1`）；
-   - 在未发起 HTTP 请求或请求尚在等待阶段，即刻返回本地接收信息；
-   - 在发起 POST 请求前，必须先在事务中将 `postAttempted` 标记为 `true` 固化落盘。
-2. **本地文件上传防护**：
-   - 仅允许读取 `uploadRoots` 白名单内的图片文件；
-   - 通过 Linux `/proc/self/fd` 验证真实路径、设备号与 Inode 属性一致性，全程禁止符号链接；非图片格式直接抛错拦截。
-3. **轮询、重试与超时控制**：
-   - 默认轮询间隔为 2000 ms，单次 HTTP 请求超时为 10 秒；
-   - 若在初次 POST 收到 202 之前网络异常，后续轮询仅以 GET 查询原任务，绝不重放 POST；
-   - 若遭遇 404，任务自动转为 `paused` 并设置状态未知提示；
-   - 超时暂停：若任务超出时限未完成，状态转为 `paused`；
-   - 恢复操作：调用 `hermes_resume` 时仅以 GET 查询原记录，绝不重新提交模型任务；若任务缺少 scopeHash 或配置 scope 变动，保持暂停且不发起 HTTP 连接。
-4. **会话回投与多媒体分流**：
-   - 任务完成时，通过 `ctx.session.prompt({ sessionID, text, files: output.files, delivery: 'queue' })` 将结果回投至原会话；客户端核心保留 `saveOutputs` 产物落地与 `output.files` 组装逻辑以兼容历史遗留结果；由于生产 `GatewayRunner` 正常 `RunResult` 仅包含文本而无输出附件，故新网关任务的 `files` 恒为 `[]`，不代表客户端删除了产物处理逻辑；
-   - 当前原生网关无输出附件契约，正常回投仅包含文本；
-   - 会话回投成功后将本地 Outbox 标记为 `delivered`。因崩溃重启窗口可能导致重复投递通知，通知中均包含 Job ID 用于去重，协议不承诺严格 exactly-once 保证。
+1. **Tool.Result 原生工具结果模型**：
+   - 插件彻底移除向宿主会话队列注入伪聊天的机制（废弃 `ctx.session.prompt`）；
+   - 工具执行直接向 OpenCode 宿主返回标准的 `Tool.Result` 对象，彻底保持聊天对话流的整洁。
+2. **多模式等待与超时分流（`waitSeconds`）**：
+   - `hermes_ask` 支持 `waitSeconds`（范围 0..120，默认 30 秒；0 秒立即返回）；
+   - 在等待期内完成的任务直接返回最终输出结果；
+   - 超过等待期限的任务返回明确的未终态状态（如 `queued` / `running`）与 Job ID；长任务在后台完成后不会擅自唤醒启动新一轮推理，必须由后续显式调用取回。
+3. **显式结果取回规范（`hermes_result`）**：
+   - 客户端通过 `hermes_result` 查询持久化任务结果，同样支持 `waitSeconds`（默认 0，范围 0..120）；
+   - 终态任务返回完整回复文本与已下载的文件资产列表；未终态返回当前状态，绝不向远端发起重复 POST。
+4. **能力探测与 Fail-Fast 阻断机制**：
+   - 客户端在准备首次提交任务时惰性调用 `GET /v1/capabilities` 并实例级缓存服务端特性；
+   - 当任务设置了 `requireFiles: true` 或包含了 `files` 输入时，若服务端未开启文件能力，客户端在前置阶段立即抛错拦截，绝不发生静默降级或提交缺失文件的无效任务。
+5. **本地文件上传防护（`uploadRoots`）**：
+   - 仅允许以 `path` 形式读取 `uploadRoots` 白名单内的文件；通过 Linux `/proc/self/fd` 验证真实路径、设备号与 Inode 属性一致性，全程禁止符号链接；
+   - 默认 `uploadRoots` 为空列表 `[]`（关闭本地路径读取）；通过 `base64` 或 `data` 形式传入的数据由 SDK 统一快照处理，不受路径白名单约束。
+6. **产物落盘与多媒体格式分流**：
+   - 输出文件资产自动安全下载至本地私有目录（`outputDir/<jobId>/<assetId>/<name>`，0600 文件 / 0700 目录）；
+   - 格式分流原则：图片与纯文本由插件转换为 `Tool.FileContent` 供模型直接理解；ZIP、PDF、XLSX 等复合二进制文件仅返回本地绝对路径、文件大小与 SHA-256 哈希，绝不将二进制原始内容拼装进模型上下文。
+7. **轮询、重试与中止操作**：
+   - 遇到暂时性网络波动或 429 时按退避策略重试 GET；遇 404 任务转为 `paused`；
+   - `hermes_resume` 仅以 GET 恢复轮询，绝不重新提交模型任务；缺少 scopeHash 或配置变动的任务保持暂停；
+   - 客户端超时取消或用户中止（AbortSignal）仅停止本地等待流程，**绝不向远端发起取消请求**，任务在服务端保持安全排队与执行。

@@ -1,0 +1,12 @@
+name: hermes_file_plugin
+version: 0.1.0
+description: >-
+  Local-only file exchange for the original Hermes instance (Hermes v2026.9.24).
+  Requires HERMES_BRIDGE_FILES_LOCAL=1, an existing owner-only (0700)
+  HERMES_BRIDGE_FILE_ROOT, and a separate HERMES_BRIDGE_FILE_TOKEN.
+  Workspaces persist; the operator must choose their retention and cleanup policy.
+author: OpenCode Hermes Bridge
+provides:
+  tools:
+    - bridge_files
+    - bridge_publish_file

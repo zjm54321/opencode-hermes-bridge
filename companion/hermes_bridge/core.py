@@ -76,7 +76,8 @@ BACKEND_VERSION = "gateway-v1-runs/1"
 
 
 def normalize_job(value: Any, limits: Limits) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != {"id", "threadId", "text", "attachments"}:
+    required = {"id", "threadId", "text", "attachments"}
+    if not isinstance(value, dict) or set(value) not in (required, required | {"input_assets"}):
         raise BridgeError("invalid_request", "Expected id, threadId, text, and attachments.")
     job_id, thread_id = uuid_string(value["id"]), uuid_string(value["threadId"])
     if utf8_size(value["text"]) > limits.text:
@@ -117,7 +118,18 @@ def normalize_job(value: Any, limits: Limits) -> dict[str, Any]:
         if len(data) > limits.file_bytes or total > limits.total_bytes:
             fail_size()
         normalized.append({"name": name, "mime": mime.lower(), "base64": canonical})
-    return {"id": job_id, "threadId": thread_id, "text": value["text"], "attachments": normalized}
+    result = {"id": job_id, "threadId": thread_id, "text": value["text"], "attachments": normalized}
+    if "input_assets" in value:
+        ids = value["input_assets"]
+        if not isinstance(ids, list):
+            raise BridgeError("invalid_request", "input_assets must be an array of UUIDs.")
+        if len(ids) > 8:
+            fail_size()
+        ids = [uuid_string(item) for item in ids]
+        if len(ids) != len(set(ids)):
+            raise BridgeError("invalid_request", "input_assets must not contain duplicate UUIDs.")
+        result["input_assets"] = ids
+    return result
 
 
 def private_directory(path: Path) -> Path:
@@ -140,6 +152,7 @@ class GatewayRecord:
 class GatewayCheckpoint(Protocol):
     def prepare(self, body: bytes, scope: str, session_id: str) -> tuple[GatewayRecord, bool]: ...
     def accepted(self, run_id: str) -> None: ...
+    def has_output_assets(self) -> bool: ...
 
 
 class RunPaused(Exception):
@@ -157,6 +170,7 @@ class RunInput:
     text: str
     attachments: tuple[dict[str, str], ...] = ()
     checkpoint: GatewayCheckpoint | None = field(default=None, repr=False, compare=False)
+    input_assets: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -292,10 +306,14 @@ class _JobCheckpoint:
             if cursor.rowcount != 1:
                 raise outcome_unknown()
 
+    def has_output_assets(self) -> bool:
+        with self.service._condition:
+            return bool(self.service.assets.output_assets(self.job_id))
+
 
 class JobService:
     def __init__(self, workspace: str | Path, runner: Runner, *, limits: Limits | None = None,
-                 autostart: bool = True):
+                 autostart: bool = True, files_enabled: bool = False, asset_ttl: float = 86400):
         scope = runner_scope(runner)
         self.workspace = private_directory(Path(workspace).absolute())
         # One owner per workspace, including across processes. A second server must
@@ -310,6 +328,7 @@ class JobService:
         self.jobs_dir = private_directory(self.workspace / "jobs")
         self.limits = limits or Limits()
         self.runner = runner
+        self.files_enabled = files_enabled
         self._condition = threading.Condition(threading.RLock())
         self._stopping = False
         self._closed = False
@@ -339,6 +358,8 @@ class JobService:
         with self._db:
             if "gateway_scope" not in {row["name"] for row in self._db.execute("PRAGMA table_info(jobs)")}:
                 self._db.execute("ALTER TABLE jobs ADD COLUMN gateway_scope TEXT")
+            if "output_assets" not in {row["name"] for row in self._db.execute("PRAGMA table_info(jobs)")}:
+                self._db.execute("ALTER TABLE jobs ADD COLUMN output_assets TEXT")
             version = self._db.execute("SELECT value FROM metadata WHERE key='backend_version'").fetchone()
             if version is None or version["value"] != BACKEND_VERSION:
                 self._db.execute("UPDATE jobs SET status='failed',text='',attachments='[]',error=? WHERE status IN ('queued','running')",
@@ -358,6 +379,13 @@ class JobService:
             self._db.execute("""UPDATE jobs SET status='failed',text='',attachments='[]',error=?
                 WHERE status IN ('queued','running') AND (gateway_scope IS NULL OR gateway_scope!=?)""",
                 (wire_json({"code": error.code, "message": error.message}).decode(), scope))
+        from .assets import AssetStore
+        try:
+            self.assets = AssetStore(self, asset_ttl)
+        except Exception:
+            self._db.close()
+            os.close(self._lock_fd)
+            raise
         if autostart:
             self.start()
 
@@ -385,6 +413,8 @@ class JobService:
                     raise BridgeError("id_conflict", "Job ID already belongs to different content.", 409)
                 return job["id"]
             with self._db:
+                if "input_assets" in job:
+                    self.assets.freeze_inputs(job)
                 self._db.execute("INSERT INTO jobs(id,thread_id,fingerprint,input,status,gateway_scope) VALUES(?,?,?,?, 'queued',?)",
                                  (job["id"], job["threadId"], fingerprint, encoded.decode(), runner_scope(self.runner)))
             self._condition.notify_all()
@@ -396,9 +426,12 @@ class JobService:
             row = self._db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             raise BridgeError("not_found", "Job not found.", 404)
-        return {"id": row["id"], "status": row["status"], "text": row["text"],
+        result = {"id": row["id"], "status": row["status"], "text": row["text"],
                 "attachments": json.loads(row["attachments"]),
                 "error": json.loads(row["error"]) if row["error"] else None}
+        if "input_assets" in json.loads(row["input"]):
+            result["output_assets"] = json.loads(row["output_assets"] or "[]") if row["status"] == "completed" else []
+        return result
 
     def close(self) -> None:
         with self._condition:
@@ -412,6 +445,7 @@ class JobService:
         if self._worker is not None:
             self._worker.join()
         with self._condition:
+            self.assets.close()
             self._db.close()
             os.close(self._lock_fd)
             self._closed = True
@@ -419,7 +453,7 @@ class JobService:
     def _request(self, job: dict[str, Any]) -> RunInput:
         # Gateway receives inline data, not bridge-local paths or legacy history.
         return RunInput(job["id"], job["threadId"], job["text"], tuple(job["attachments"]),
-                        _JobCheckpoint(self, job["id"]))
+                        _JobCheckpoint(self, job["id"]), tuple(job["input_assets"]) if "input_assets" in job else None)
 
     def _work(self) -> None:
         while True:
@@ -437,6 +471,8 @@ class JobService:
                 if row["gateway_scope"] is None or row["gateway_scope"] != getattr(self.runner, "scope", None):
                     raise outcome_unknown()
                 request = self._request(json.loads(row["input"]))
+                if request.input_assets is not None and not self.files_enabled:
+                    raise BridgeError("assets_disabled", "File transfer is not configured.", 415)
                 result = self.runner.run(request)
                 output_started = True
                 if not isinstance(result, RunResult):
@@ -444,17 +480,25 @@ class JobService:
                 text = result.final_response
                 if utf8_size(text) > self.limits.text:
                     fail_size()
-                if re.search(r"\bMEDIA:", text, re.IGNORECASE):
-                    raise BridgeError("unsupported_output", "Gateway file output is not supported.", 502)
                 attachments = normalize_job({"id": request.job_id, "threadId": request.thread_id,
                                              "text": "", "attachments": result.attachments}, self.limits)["attachments"]
-                response = {"id": row["id"], "status": "completed", "text": text,
-                            "attachments": attachments, "error": None}
-                if len(wire_json(response)) > self.limits.body:
-                    fail_size()
                 with self._condition, self._db:
-                    self._db.execute("UPDATE jobs SET status='completed',text=?,attachments=?,error=NULL WHERE id=?",
-                                     (text, wire_json(attachments).decode(), row["id"]))
+                    outputs = self.assets.output_assets(row["id"]) if request.input_assets is not None else []
+                    if re.search(r"\bMEDIA:", text, re.IGNORECASE) and not outputs:
+                        raise BridgeError("unsupported_output", "Gateway file output is not supported.", 502)
+                    if (len(outputs) + len(attachments) > 8 or sum(item["size"] for item in outputs)
+                            + sum(len(base64.b64decode(item["base64"])) for item in attachments) > 20 * 1024 * 1024):
+                        fail_size()
+                    response = {"id": row["id"], "status": "completed", "text": text,
+                                "attachments": attachments, "error": None}
+                    if request.input_assets is not None:
+                        response["output_assets"] = outputs
+                    if len(wire_json(response)) > self.limits.body:
+                        fail_size()
+                    # Same lock/transaction as asset publication: late publishers
+                    # cannot join the result after this terminal freeze.
+                    self._db.execute("UPDATE jobs SET status='completed',text=?,attachments=?,output_assets=?,error=NULL WHERE id=?",
+                                     (text, wire_json(attachments).decode(), wire_json(outputs).decode(), row["id"]))
             except RunPaused:
                 # Preserve running + checkpoint for GET-only recovery; no remote stop.
                 return

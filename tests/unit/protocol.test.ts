@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { config } from '../../src/core.js'
-import { LIMITS, readJSON, text } from '../../src/protocol.js'
+import { asset, assets, contentDisposition, hashBytes, LIMITS, readBytes, readJSON, response, text, verifyAssetHeaders, verifyBytes } from '../../src/protocol.js'
+import { randomUUID } from 'node:crypto'
 
 describe('configuration and wire limits', () => {
   test('defaults, env-only secret, explicit roots, unsafe endpoints rejected', () => {
@@ -32,5 +33,33 @@ describe('configuration and wire limits', () => {
   test('text limit measures UTF-8 bytes', () => {
     expect(text('a'.repeat(LIMITS.text))).toHaveLength(LIMITS.text)
     expect(() => text('你'.repeat(Math.ceil(LIMITS.text / 3)))).toThrow('64 KiB')
+  })
+  test('raw asset headers, manifest, size/hash and bounded stream are validated independently', async () => {
+    const bytes = Buffer.from([0, 255, 0x50, 0x4b])
+    const a = { asset_id: randomUUID(), name: "测试 'file'.zip", mime: 'application/zip', size: bytes.length, sha256: hashBytes(bytes) }
+    expect(asset({ ...a, path: '/private/Hermes/path-must-not-leak' })).toEqual(a)
+    const headers = new Headers({ 'Content-Type': a.mime, 'Content-Length': String(a.size), 'Content-Disposition': contentDisposition(a.name), 'X-Content-SHA256': a.sha256 })
+    expect(() => verifyAssetHeaders(headers, a)).not.toThrow()
+    verifyBytes(a, await readBytes(new Response(bytes, { headers }), a.size))
+    for (const [key, value] of [['Content-Length', '100'], ['Content-Disposition', "attachment; filename*=UTF-8''..%2Fescape"], ['X-Content-SHA256', '0'.repeat(64)], ['Content-Type', 'text/plain'], ['Content-Encoding', 'gzip']]) {
+      const changed = new Headers(headers)
+      changed.set(key!, value!)
+      expect(() => verifyAssetHeaders(changed, a)).toThrow('metadata mismatch')
+    }
+    for (const patch of [{ asset_id: 'bad' }, { name: '../escape' }, { size: LIMITS.file + 1 }, { size: -1 }, { sha256: 'bad' }]) expect(() => asset({ ...a, ...patch })).toThrow()
+    expect(() => assets([a, a])).toThrow('Duplicate asset ID')
+    expect(() => assets([a, { ...a, asset_id: randomUUID() }])).not.toThrow() // Same names are isolated by asset ID.
+    for (const status of ['queued', 'running', 'failed']) {
+      const pending = { id: a.asset_id, status, text: '', attachments: [], error: null, output_assets: [] }
+      expect(response(pending, a.asset_id).output_assets).toEqual([])
+      expect(() => response({ ...pending, output_assets: [a] }, a.asset_id)).toThrow('require a completed job')
+    }
+    expect(response({ id: a.asset_id, status: 'completed', text: '', attachments: [], error: null, output_assets: [a] }, a.asset_id).output_assets).toEqual([a])
+    let cancelled = false
+    const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(Buffer.alloc(a.size + 1)) }, cancel() { cancelled = true } })
+    await expect(readBytes(new Response(stream, { headers }), a.size)).rejects.toThrow('size limit')
+    expect(cancelled).toBe(true)
+    expect(() => verifyBytes(a, Buffer.alloc(a.size))).toThrow('size/SHA-256 mismatch')
+    expect(await readBytes(new Response(null), 0)).toEqual(Buffer.alloc(0))
   })
 })

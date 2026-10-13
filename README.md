@@ -298,3 +298,11 @@ python -m hermes_bridge.init \
   - 仅验证了原 Gateway 链路与配置保持；追加既有资料询问获得有效回应，未逐条核验全部记忆或证明所有 Honcho peer 完全一致（不计入验收 fixtures，文档不包含个人具体资料）；
   - 原会话后台消息回传已验证（收到真实文本与图片通知，delivered 置为 true）；真实前端页面呈现、权限确认弹窗及模型自主工具调用未做专门 UI 测试；
   - **清理与收尾完成（C1/C2）**：旧独立 Deployment 已删除（旧 Pod 为 0），旧 home 与 hermes-profile 孤立目录已清理完毕（移除 556 文件与 27 目录），jobs/DB 完整保留，原 hermes-agent Pod、Deployment 与 Services 均保持不变，未访问原 /opt/data；GitOps 已完成废弃模型凭据字段（`HERMES_BRIDGE_MODEL_API_KEY`）清理（commit `a93555a`），生产 Secret 仅保留有效的 Bridge 与 Gateway 双令牌，验证与鉴权探测全数通过。阶段验收结论以正式文档为准。
+
+---
+
+## 10. ChatGPT Remote MCP 服务（本地实现与宿主验证完成，未部署）
+
+项目在 `mcp/` 目录提供了面向 ChatGPT 网页端（Business / Enterprise）的标准 Streamable HTTP `/mcp` 服务（启动脚本 `bun run mcp:start`），基于官方 MCP SDK 构建并受独立 OAuth 2.0 保护，支持 `hermes_submit`、`hermes_status`、`hermes_result` 三项工具与原生 Resources 原字节文件交付。本地离线已完成全套验证（`bun run test:mcp` 17 项测试 / 478 断言及类型检查全部通过），并在真实隔离 OpenCode 2.0.27 宿主中实际调用 MCP 三工具与 Code Mode `read_mcp_resource` 验证了 318 字节 ZIP 原件完整闭环（哈希一致，向仿真原生网关 POST 1 次，无自动落盘）。详细架构设计、配置变量与安全契约请参考专门文档 [docs/CHATGPT_MCP.md](docs/CHATGPT_MCP.md)。
+
+> **说明**：该服务目前已完成源码实现与真实宿主离线闭环，尚未在真实 ChatGPT 账户或生产环境连接部署；实际接入使用需外部配置域名证书、真实 OAuth 授权服务器并取得工作区管理权限。

@@ -247,6 +247,26 @@ Python 服务端测试套件包含 29 个测试项（耗时 8.430s 无 skip，�
    - 支持常规格式（ZIP、PDF、XLSX、DOCX 等）原始二进制传输，单文件 10 MiB / 单向总计 20 MiB / 8 资产；
    - 客户端默认 `uploadRoots: []` 拦截本地 path 读取；产物落盘后仅图片/文本注入模型上下文，ZIP/二进制仅在工具结果中回显落盘路径与哈希。
 
+### 3.10 ChatGPT Remote MCP 边缘服务实现（本地实现与宿主验证完成、未部署）
+
+针对 ChatGPT 网页端（Business / Enterprise 工作区）接入，源码在 `mcp/` 目录新增基于标准 Stateless Streamable HTTP 的 `/mcp` 边缘服务（详细架构规范参见 [docs/CHATGPT_MCP.md](CHATGPT_MCP.md)）：
+
+1. **协议与工具实现范围**：
+   - 基于官方 MCP SDK（`@modelcontextprotocol/server 2.3.1` + `@modelcontextprotocol/node 2.1.1`）；
+   - 提供 `hermes_submit`（声明 `destructiveHint: true`，支持 `request_id` 幂等去重、`thread_id` 续接会话、单文件 `file` 引用及 `_meta['openai/fileParams']=['file']` 约定）、`hermes_status` 及 `hermes_result` 三项工具；
+   - 产物默认通过 MCP 原生 Resources 规范（`ResourceTemplate: hermes://jobs/{job_id}/assets/{asset_id}`）与认证 `resources/read` 获取 `blob` 原字节交付；仅在显式配置 `HERMES_MCP_HTTP_DOWNLOADS=1` 时生成短时受控 HTTPS 兼容链接；
+   - 依赖外部标准 OAuth 2.0 授权服务器，提供 `/.well-known/oauth-protected-resource` 发现元数据，严格校验 RS256/ES256 JWT（iss、aud 包含或匹配 resource、exp 必需、nbf 存在则校验、sub 绑定以及 scope `hermes:use`）；
+   - 遵循单 Owner 原则绑定个人原 Hermes 记忆与 profile，独立私有状态目录（`state.json` 0600，`writer.lock` 单写者排他锁且异常不偷锁）。
+2. **测试状态与全套离线验证证据**（执行 `nix develop --offline --no-update-lock-file`）：
+   - **类型检查**：`bun run typecheck` 与 `bun run typecheck:mcp` 全数通过（0 错误）；
+   - **MCP 测试套件**：`bun run test:mcp` 通过 17 项测试与 478 个断言（耗时 13.69s，0 失败；涵盖 12 项核心状态机测试、3 项边缘 HTTP/OAuth 测试、1 项原生 resources 测试及 1 项端到端整合测试）；
+   - **整合链路验证**：整合测试真实覆盖了 OAuth JWT 签名校验 -> 官方 MCP Streamable HTTP 协议交互 -> 真实 Bridge / Companion / GatewayRunner 任务流转 -> 真实 `hermes_file_plugin` 插件调度 -> 原生 `resources/read` 获取 `blob` 原始字节及 ZIP 原件 SHA-256 哈希比对闭环（测试中外部平台文件下载与上游 Gateway/model 运行时采用离线仿真）；
+   - **隔离打包验证**：隔离 Bun build 编译通过（168 modules，打包产物 `mcp.js` 0.97 MB），线上 `dist/` 目录哈希保持不变；
+   - **代码风格与空白校验**：`git diff --check` 全数通过；Python 后端与 `hermes_file_plugin` 源码自上轮提交 `f4503dd` 以来未变，沿用上轮 43 项 Python 测试通过证据；
+   - **真实 OpenCode 宿主验收证据**：在隔离环境中通过真实 OpenCode 2.0.27 宿主二进制完成实测闭环。宿主成功连接 MCP 服务，实际调用 `hermes_submit`（触发原生网关 POST 1 次、外部文件导入 1 次）、`hermes_status`、`hermes_result` 与重复 submit 幂等复用；随后在 Code Mode 下检索发现并调用 `tools.opencode.read_mcp_resource({server, uri})` 读取资源，返回的 Base64 blob 解码后 318 字节 ZIP 与源原件 SHA-256 哈希（`75e419f42626b40231569f6bbc57b05fa106815ce0e73dbe1c6587b8bc0468af`）完全一致。整个过程未生成 HTTP 能力链接，无自动本地落盘（`automaticFileSave: false`）。
+   - **资源读取与清理**：服务端实际处理 `readResource` 1 次，未通过独立 HTTP 下载接口取件。隔离宿主退出、运行夹具清理完成，生产服务及 `dist/` 未改动。
+   - **真实外部环境边界**：测试中上游 Gateway/model 与外部文件源采用本地仿真，宿主调用由脚本化 provider 驱动；真实 ChatGPT 网页端附件自动绑定、原生文件卡片呈现及商业 OAuth 真实账户接入仍待实测。本轮 MCP 代码在本地验证完成，未部署生产。
+
 ---
 
 ## 4. 真实外部实体与模型联调现状

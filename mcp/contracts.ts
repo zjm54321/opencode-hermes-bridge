@@ -7,7 +7,6 @@ export interface SubmitInput {
 }
 export interface PublicFile {
   asset_id: string; name: string; mime: string; size: number; sha256: string; uri: string
-  url?: string; expires_at?: number
 }
 export interface PublicResult {
   job_id: string; thread_id: string; status: string; final: boolean

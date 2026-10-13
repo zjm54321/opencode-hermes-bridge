@@ -2,14 +2,13 @@ import { randomUUID } from 'node:crypto'
 import { isAbsolute, resolve } from 'node:path'
 import { Bridge, waitSeconds, type Config, type OutboxJob } from '../src/core.js'
 import { hashBytes, LIMITS, mime, name, record, text, uuid } from '../src/protocol.js'
-import { httpsURL } from './config.js'
 import { invalidInput, McpError, resourceIdentity, unavailable, type FileRef, type NormalizedFile, type Principal, type PublicFile, type PublicResult, type SubmitInput } from './contracts.js'
 import { McpOutputs } from './outputs.js'
 import { McpState, privateDirectory } from './state.js'
 
 export interface McpBridgeOptions {
-  bridgeConfig: Config; stateDirectory: string; publicOrigin: string; allowedPrincipal: Principal
-  downloadFile: (ref: FileRef) => Promise<NormalizedFile>; linkTtlSeconds?: number; httpDownloads?: boolean
+  bridgeConfig: Config; stateDirectory: string; allowedPrincipal: Principal
+  downloadFile: (ref: FileRef) => Promise<NormalizedFile>
 }
 interface ValidatedInput extends SubmitInput { fingerprint: string }
 function validateInput(input: SubmitInput): ValidatedInput {
@@ -47,20 +46,16 @@ export class McpBridgeService {
   static async open(options: McpBridgeOptions): Promise<McpBridgeService> {
     let state: McpState | undefined, bridge: Bridge | undefined
     try {
-      const origin = httpsURL(options.publicOrigin, true).origin
       const { issuer, subject } = options.allowedPrincipal
       if (typeof issuer !== 'string' || typeof subject !== 'string' || !issuer || !subject
           || issuer.length > 8192 || subject.length > 8192 || !isAbsolute(options.bridgeConfig.outputDir)) throw invalidInput()
-      const ttl = options.linkTtlSeconds ?? 600
-      if (!Number.isSafeInteger(ttl) || ttl < 1 || ttl > 3600) throw invalidInput()
-      if (options.httpDownloads !== undefined && typeof options.httpDownloads !== 'boolean') throw invalidInput()
       const owner = hashBytes(Buffer.from(JSON.stringify([issuer, subject])))
       state = await McpState.open(options.stateDirectory, owner)
       const outputRoot = resolve(options.bridgeConfig.outputDir, owner)
       const directory = await privateDirectory(outputRoot)
       await directory.close()
       bridge = await Bridge.create({ ...options.bridgeConfig, outputDir: outputRoot, uploadRoots: [] }, { storage: state })
-      const service = new McpBridgeService(state, bridge, new McpOutputs(state, outputRoot, origin, ttl, options.httpDownloads),
+      const service = new McpBridgeService(state, bridge, new McpOutputs(state, outputRoot),
         Object.freeze({ issuer, subject }), options.downloadFile)
       bridge.start()
       return service
@@ -143,7 +138,7 @@ export class McpBridgeService {
       // This materializes verified local artifacts, but its content contains local
       // paths/data URIs and must never be forwarded to a remote model context.
       await this.bridge.result(job.sessionID, job.id, { waitSeconds: seconds })
-      const files = await this.outputs.issue(job.id)
+      const files = this.outputs.descriptors(job.id)
       return this.view(job.id, true, files)
     } catch (error) {
       if (error instanceof McpError) throw error
@@ -165,10 +160,6 @@ export class McpBridgeService {
       if (error instanceof McpError) throw error
       throw new McpError(503, 'resource_unavailable', 'Resource is temporarily unavailable')
     }
-  }
-  async download(capability: string): Promise<{ file: PublicFile; bytes: Uint8Array }> {
-    if (this.closing) throw unavailable()
-    return this.outputs.download(capability)
   }
   close(): Promise<void> {
     if (!this.closeWork) {

@@ -1,30 +1,36 @@
-# Cross-language HTTP integration tests
-
-Run from the project root:
+# Bounded cross-language checks
 
 ```sh
-nix develop --command bun run test:integration
+nix develop --offline --no-update-lock-file --command bun test tests/unit
+nix develop --offline --no-update-lock-file --command bun run test:integration
 ```
 
-These tests use the real TypeScript `Bridge`, native fetch, and Python production
-HTTP/service/SQLite boundaries. The test-only `companion/tests/http_fixture.py`
-injects **EchoRunner**, not Hermes or a real model. Prompt delivery is collected at
-the V2-shaped callback boundary: this is **not** evidence of real Hermes attachment
-understanding or automatic delivery/rendering in a running OpenCode host UI.
+Two integration flows use native fetch and production Python HTTP/service/SQLite:
 
-Three bounded scenarios cover:
-1. Input rejection of ordinary files (TXT/PDF/ZIP rejected before HTTP submission), byte-preserving PNG transfer across three input shapes (data URLs, explicit upload roots, and raw base64) with private output hashes (0600 file / 0700 dir), local acceptance before HTTP, outbox restart with an unrecorded acknowledgement (preventing POST replay via postAttempted), server idempotency via manual duplicate POST (202 without rerun) versus conflict 409, session isolation, and verification that bridge conversation history remains empty.
-2. Sanitized HTTP 401 authentication rejection: creates no server job, halts automatic retry, and notifies the session once.
-3. Sanitized worker execution failure: error is delivered, while a subsequent request on the same thread succeeds cleanly with empty legacy history.
+1. **HTTP admission and recovery:** unauthorized POST creates no job; authorized
+   PNG + PDF snapshots survive source mutation and a lost real 202. An identical
+   UUID returns 202, conflicting content returns 409. Restart recovers by GET only;
+   original bytes become a session-bound, cached `Tool.Result` without chat history.
+   This uses the test-only EchoRunner, not a model.
+2. **Native file workflow:** PNG + original ZIP travel through the real
+   `GatewayRunner`; the actual `hermes_file_plugin` downloads and publishes the ZIP
+   over production asset HTTP. Only the native Gateway/runtime/model is fake.
+   Evidence checks multimodal PNG input, one native submission, unchanged ZIP
+   bytes, private local files, and result reads after restart without resubmission
+   or redownload. It does not claim that a real model understood either file.
 
-Read-only SQLite job/history queries plus unchanged artifact mtimes provide basic
-evidence that manual duplicate submissions did not rerun the executor. They do not prove
-exactly-once prompt delivery; the documented queue/persist crash window remains.
+Seven unit scenarios cover SDK registration/permissions and formal results;
+durable intent/unknown outcomes/scope-bound GET recovery; unbound legacy outboxes;
+bounded waits/cancellation; local upload boundaries; raw transfer integrity and
+non-overwriting private output; representative configuration/wire limits. Legacy
+scope and cancellation remain separate to make these safety failures identifiable.
+MIME/status/input-shape matrices and repeated echo/failure/restart cases were
+removed rather than hidden under fewer test names. File transfer and restart
+recovery remain supported product paths.
 
-Every invocation creates an isolated directory under `/tmp/opencode`, a random
-token only in the owned child environment, and an ephemeral loopback port.
-Readiness and polling are bounded. Cleanup disposes clients, sends SIGINT with
-SIGTERM/SIGKILL fallback only to its own child, and removes only its own temporary
-directory. No real model credentials, host configuration, or debug endpoint is used.
-Fixture bytes are generated using the Python standard library (1×1 PNG with CRCs,
-UTF-8 text, a PDF with correct xref offsets, and a ZIP with a verified member).
+The shared harness is also used by MCP tests and is unchanged. Fixtures bind an
+ephemeral loopback port, use generated test credentials and files under
+`/tmp/opencode`, and clean up only their own child processes/directories. No remote
+model, private credential, running host UI, or deployment is exercised. SQLite
+rows and cached file timestamps are evidence of these tested transitions, not an
+exactly-once guarantee across arbitrary server crashes.

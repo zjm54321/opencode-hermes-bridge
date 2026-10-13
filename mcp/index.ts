@@ -7,8 +7,8 @@ import { McpBridgeService } from './service.js'
 export async function startMcp(env: Record<string, string | undefined> = process.env) {
   const config = mcpConfig(env)
   const service = await McpBridgeService.open({
-    bridgeConfig: bridgeConfig({}, env), stateDirectory: config.stateDirectory, publicOrigin: config.publicOrigin,
-    allowedPrincipal: configuredPrincipal(config), downloadFile: createFileIngress(config.fileOrigins), httpDownloads: config.httpDownloads,
+    bridgeConfig: bridgeConfig({}, env), stateDirectory: config.stateDirectory,
+    allowedPrincipal: configuredPrincipal(config), downloadFile: createFileIngress(config.fileOrigins),
   })
   const server = createMcpHttpServer(config, service)
   try {

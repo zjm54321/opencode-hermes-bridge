@@ -3,7 +3,7 @@ import { lstat, mkdir, open, realpath, rename, unlink, type FileHandle } from 'n
 import { isAbsolute, resolve, sep } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import type { OutboxJob, Storage } from '../src/core.js'
-import { asset, record, uuid, type Asset } from '../src/protocol.js'
+import { record, uuid } from '../src/protocol.js'
 import { McpError, unavailable } from './contracts.js'
 
 export const MAX_STATE_BYTES = 128 * 1024 ** 2
@@ -43,13 +43,9 @@ export async function privateDirectory(path: string): Promise<FileHandle> {
 export interface CoreOutbox { version: 1; threads: Record<string, string>; jobs: Record<string, OutboxJob> }
 export interface ThreadRecord { owner: string; sessionID: string }
 export interface RequestRecord { owner: string; fingerprint: string; threadId: string; jobId: string }
-export interface CapabilityRecord extends Asset {
-  owner: string; jobId: string; path: string; expiresAt: number; kind: 'asset' | 'inline'
-}
 export interface Envelope {
   version: 1; owner: string; coreOutbox: CoreOutbox
   threads: Record<string, ThreadRecord>; requests: Record<string, RequestRecord>
-  capabilities: Record<string, CapabilityRecord>
 }
 interface Admission { requestId: string; fingerprint: string; threadId: string; sessionID: string }
 const digest = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
@@ -59,8 +55,8 @@ function validate(value: unknown, owner: string): Envelope {
   if (e.version !== 1 || e.owner !== owner) throw unavailable()
   const core = record(e.coreOutbox)
   if (core.version !== 1 || Object.keys(record(core.jobs)).length > MAX_JOBS) throw unavailable()
-  const threads = record(e.threads), requests = record(e.requests), caps = record(e.capabilities)
-  if (Object.keys(threads).length > MAX_JOBS || Object.keys(requests).length > MAX_JOBS || Object.keys(caps).length > 8192) throw unavailable()
+  const threads = record(e.threads), requests = record(e.requests)
+  if (Object.keys(threads).length > MAX_JOBS || Object.keys(requests).length > MAX_JOBS) throw unavailable()
   const sessions = record(core.threads)
   for (const [id, raw] of Object.entries(threads)) {
     const thread = record(raw)
@@ -75,14 +71,9 @@ function validate(value: unknown, owner: string): Envelope {
     mapped.add(String(r.jobId))
   }
   if (Object.keys(record(core.jobs)).some(id => !mapped.has(id)) || Object.keys(sessions).length !== Object.keys(threads).length) throw unavailable()
-  for (const [hash, raw] of Object.entries(caps)) {
-    const c = record(raw)
-    asset(c)
-    if (!digest(hash) || c.owner !== owner || !mapped.has(uuid(c.jobId)) || typeof c.path !== 'string'
-        || !isAbsolute(c.path) || (c.kind !== 'asset' && c.kind !== 'inline')
-        || typeof c.expiresAt !== 'number' || !Number.isSafeInteger(c.expiresAt) || c.expiresAt < 0) throw unavailable()
-  }
-  return value as Envelope
+  // The undeployed HTTP-link experiment is retired; retain all identity/job records.
+  const { capabilities: _retired, ...current } = e
+  return current as unknown as Envelope
 }
 
 /** One writer and one atomic envelope for both Bridge and public identity mappings.
@@ -109,7 +100,7 @@ export class McpState implements Storage {
         throw error
       }
       state = new McpState(resolve(directory), owner, handle, lock, {
-        version: 1, owner, coreOutbox: { version: 1, threads: {}, jobs: {} }, threads: {}, requests: {}, capabilities: {},
+        version: 1, owner, coreOutbox: { version: 1, threads: {}, jobs: {} }, threads: {}, requests: {},
       })
       await lock.writeFile(JSON.stringify({ pid: process.pid, nonce: randomBytes(32).toString('hex') }))
       await lock.sync(); await handle.sync()
@@ -127,7 +118,9 @@ export class McpState implements Storage {
         }
         const after = await file.stat()
         if (length !== info.size || after.size !== info.size || after.mtimeMs !== info.mtimeMs) throw unavailable()
-        state.envelope = validate(JSON.parse(bytes.subarray(0, length).toString('utf8')), owner)
+        const saved: unknown = JSON.parse(bytes.subarray(0, length).toString('utf8'))
+        state.envelope = validate(saved, owner)
+        if (Object.hasOwn(record(saved), 'capabilities')) await state.persist(state.envelope)
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
       finally { await file?.close() }
       return state
@@ -179,12 +172,6 @@ export class McpState implements Storage {
       next.coreOutbox = core
     })
     if (admitted) this.pending = undefined
-  }
-  async addCapabilities(values: Record<string, CapabilityRecord>): Promise<void> {
-    await this.mutate(next => {
-      for (const [hash, c] of Object.entries(next.capabilities)) if (c.expiresAt <= Date.now()) delete next.capabilities[hash]
-      Object.assign(next.capabilities, values)
-    })
   }
   private async persist(next: Envelope): Promise<void> {
     const value = JSON.stringify(next)

@@ -1,14 +1,13 @@
 // Linux only. Dedicated new volumes only; no recursive chown, deletion or repair.
 import {
   constants as C, openSync, closeSync, fstatSync, fchmodSync, fchownSync,
-  readdirSync, mkdirSync, writeFileSync, readFileSync, fsyncSync,
+  readdirSync, mkdirSync, fsyncSync,
 } from 'node:fs';
-import { createHash } from 'node:crypto';
 
 const UID = 10000, GID = 10000;
 const O_PATH = 0o10000000; // Linux O_PATH; permits checking an existing private root without DAC override.
 const at = (fd, name = '.') => `/proc/self/fd/${fd}/${name}`;
-const fail = () => { throw new Error('Private volume refused: unexpected identity, ownership, permissions or contents; no repair attempted'); };
+const fail = () => { throw new Error('Private volume refused: unexpected ownership, permissions or contents; no repair attempted'); };
 function privateDir(stat, uid = UID, gid = GID) {
   if (!stat.isDirectory() || stat.uid !== uid || stat.gid !== gid || (stat.mode & 0o7777) !== 0o700) fail();
 }
@@ -41,43 +40,27 @@ export function prepareRoot(path) {
   } finally { if (fd !== undefined) closeSync(fd); closeSync(pathFD); }
 }
 
-function identity(env) {
-  const owner = env.HERMES_MCP_PRIVATE_OWNER ?? '', tunnel = env.HERMES_MCP_TUNNEL_ID ?? '';
-  if (env.HERMES_MCP_AUTH_MODE !== 'private-tunnel' || !owner || owner.trim() !== owner
-      || Buffer.byteLength(owner) > 256 || /[\p{Cc}\p{Cf}]/u.test(owner)
-      || !/^tunnel_[a-z0-9]{32}$/.test(tunnel)) fail();
-  return { version: 1, mode: 'private-tunnel', principal: createHash('sha256').update(JSON.stringify([owner, tunnel])).digest('hex') };
-}
-
-export function prepareState(path, env = process.env, uid = UID, gid = GID) {
+export function prepareState(path, uid = UID, gid = GID) {
   // uid/gid parameters are for the unprivileged fixture, never CLI-configurable.
-  const binding = identity(env), fd = directory(path);
-  const marker = '.private-tunnel-volume.json';
+  const fd = directory(path), children = [];
   try {
     privateDir(fstatSync(fd), uid, gid);
     const names = readdirSync(at(fd));
     if (names.length === 0) {
-      // Marker is written LAST. Interrupted initialization is deliberately fail-closed.
       for (const name of ['state', 'outputs']) mkdirSync(at(fd, name), { mode: 0o700 });
-      const out = openSync(at(fd, marker), C.O_WRONLY | C.O_CREAT | C.O_EXCL | C.O_NOFOLLOW, 0o600);
-      try { writeFileSync(out, JSON.stringify(binding)); fsyncSync(out); } finally { closeSync(out); }
       fsyncSync(fd);
-    } else {
-      if (names.length !== 3 || ![marker, 'state', 'outputs'].every(name => names.includes(name))) fail();
-      const input = openSync(at(fd, marker), C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
-      try {
-        const s = fstatSync(input);
-        if (!s.isFile() || s.uid !== uid || s.gid !== gid || (s.mode & 0o7777) !== 0o600 || s.nlink !== 1 || s.size > 1024) fail();
-        if (readFileSync(input, 'utf8') !== JSON.stringify(binding)) fail();
-      } finally { closeSync(input); }
-    }
+    } else if (names.length !== 2 || !['state', 'outputs'].every(name => names.includes(name))) fail();
     for (const name of ['state', 'outputs']) {
       const child = openSync(at(fd, name), C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
-      try { privateDir(fstatSync(child), uid, gid); } finally { closeSync(child); }
+      children.push(child);
+      privateDir(fstatSync(child), uid, gid);
     }
-    // The application verifies the ledger, its binding, locks and 0600 state files.
-    // Nothing here clears writer.lock or recreates a missing state/output directory.
-  } finally { closeSync(fd); }
+    const stateNames = readdirSync(at(children[0]));
+    // Missing ledger is safe only before any state/output exists, not after data loss.
+    if (!stateNames.includes('state.json') && (stateNames.length || readdirSync(at(children[1])).length)) fail();
+    // McpState.owner is the sole identity binding. The application validates existing
+    // ledger files/locks; init never reads, repairs, deletes or rebinds them.
+  } finally { for (const child of children) closeSync(child); closeSync(fd); }
 }
 
 export function prepareScratch(path) {

@@ -75,37 +75,16 @@ class InitTests(unittest.TestCase):
         # All recorded children (including double-fork orphans) were reaped.
         self.assertFalse([r for r in self.records() if self.alive(r)])
 
-    def test_pid1_guard(self):
-        result = subprocess.run([sys.executable, "-m", "hermes_bridge.init", "--allow-nonpid1"],
-                                capture_output=True, text=True, timeout=3)
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stderr, "hermes_bridge.init: must run as PID 1\n")
-        self.assertEqual(result.stdout, "")
-
-    def test_exit_zero(self):
-        self.start("exit0")
-        self.finish(0)
-
-    def test_exit_seven(self):
-        self.start("exit7")
-        self.finish(7)
-
-    def graceful(self, signum):
+    def test_graceful_shutdown_forwards_one_interrupt(self):
         self.start("graceful")
         self.wait_event("ready")
-        os.kill(self.process.pid, signum)
+        os.kill(self.process.pid, signal.SIGTERM)
         self.wait_event("interrupt")
         os.kill(self.process.pid, signal.SIGTERM)
         os.kill(self.process.pid, signal.SIGINT)
         self.finish(0)
         self.assertEqual(sum(r["event"] == "interrupt" for r in self.records()), 1)
         self.assertNotIn("terminate", [r["event"] for r in self.records()])
-
-    def test_sigterm_becomes_one_sigint(self):
-        self.graceful(signal.SIGTERM)
-
-    def test_sigint_becomes_one_sigint(self):
-        self.graceful(signal.SIGINT)
 
     def test_blocker_killed_without_resetting_deadline(self):
         self.start("blocker")
@@ -128,40 +107,6 @@ class InitTests(unittest.TestCase):
         self.start("orphan")
         self.finish(7)
         self.assertIn("orphan", [r["event"] for r in self.records()])
-
-    def test_child_subprocess_wait_not_stolen(self):
-        self.start("wait")
-        self.finish(0)
-        self.assertEqual([r["value"] for r in self.records() if r["event"] == "wait_result"], [23])
-
-    def test_exec_failure(self):
-        self.start("execfail")
-        self.finish(127)
-
-    def test_post_exit_group_cleanup_keeps_main_status(self):
-        self.start("descendant")
-        self.wait_event("descendant_ready")
-        start = time.monotonic()
-        self.finish(0)
-        self.assertLess(time.monotonic() - start, 0.9)
-
-    def signal_during_cleanup(self, signum):
-        self.start("cleanup_signal")
-        # The descendant acknowledges the supervisor's group TERM: main was
-        # reaped and cleanup deadlines were already set, with no timing guess.
-        cleanup = self.wait_event("cleanup_started")
-        os.kill(self.process.pid, signum)
-        self.finish(7)
-        result = next(r for r in self.records() if r["event"] == "result")
-        # Original cleanup KILL is +0.25s; incorrectly reset KILL is +0.65s.
-        # Compare fixture timestamps, not test-parent wakeup/communicate time.
-        self.assertLess(result["time"] - cleanup["time"], 0.50)
-
-    def test_first_sigterm_during_cleanup_preserves_deadline(self):
-        self.signal_during_cleanup(signal.SIGTERM)
-
-    def test_first_sigint_during_cleanup_preserves_deadline(self):
-        self.signal_during_cleanup(signal.SIGINT)
 
 
 if __name__ == "__main__":

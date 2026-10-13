@@ -11,7 +11,6 @@
       "apiVersion": "v1", "kind": "ConfigMap",
       "metadata": {"name": "hermes-mcp", "namespace": "ai-services"},
       "data": {
-        "auth-mode": "private-tunnel",
         "private-owner": "REPLACE_ME_PRIVATE_OWNER",
         "tunnel-id": "REPLACE_ME_TUNNEL_ID",
         "file-origins": "[]"
@@ -64,11 +63,6 @@
                 "name": "volume-private", "image": "REPLACE_ME_MCP_IMAGE",
                 "imagePullPolicy": "IfNotPresent",
                 "command": ["bun", "/app/volume-init.mjs", "private"],
-                "env": [
-                  {"name": "HERMES_MCP_AUTH_MODE", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "auth-mode"}}},
-                  {"name": "HERMES_MCP_PRIVATE_OWNER", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "private-owner"}}},
-                  {"name": "HERMES_MCP_TUNNEL_ID", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "tunnel-id"}}}
-                ],
                 "securityContext": {"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": {"drop": ["ALL"]}},
                 "resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"cpu": "100m", "memory": "128Mi"}},
                 "volumeMounts": [
@@ -82,13 +76,11 @@
               {
                 "name": "mcp", "image": "REPLACE_ME_MCP_IMAGE", "imagePullPolicy": "IfNotPresent",
                 "env": [
-                  {"name": "HERMES_MCP_AUTH_MODE", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "auth-mode"}}},
                   {"name": "HERMES_MCP_PRIVATE_OWNER", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "private-owner"}}},
                   {"name": "HERMES_MCP_TUNNEL_ID", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "tunnel-id"}}},
                   {"name": "HERMES_MCP_FILE_ORIGINS", "valueFrom": {"configMapKeyRef": {"name": "hermes-mcp", "key": "file-origins"}}},
                   {"name": "HERMES_MCP_HOST", "value": "127.0.0.1"},
                   {"name": "HERMES_MCP_PORT", "value": "8790"},
-                  {"name": "HERMES_MCP_HTTP_DOWNLOADS", "value": "0"},
                   {"name": "HERMES_MCP_STATE_DIR", "value": "/private/state"},
                   {"name": "HERMES_BRIDGE_OUTPUT_DIR", "value": "/private/outputs"},
                   {"name": "HERMES_BRIDGE_URL", "value": "http://hermes-bridge.ai-services.svc.cluster.local:8787"},

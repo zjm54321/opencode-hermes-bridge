@@ -46,6 +46,54 @@ jobs:
             --label "org.opencontainers.image.licenses=GPL-3.0-or-later" \
             .
 
+      - name: Regress root volume initialization before publishing
+        run: |
+          set -euo pipefail
+          # Dedicated synthetic tmpfs only; no DAC_OVERRIDE, network or host mounts.
+          docker run --rm --network none --read-only --user 0:0 \
+            --cap-drop ALL --cap-add CHOWN --cap-add FOWNER \
+            --security-opt no-new-privileges=true \
+            --tmpfs /work/data:rw,noexec,nosuid,nodev,size=1m,mode=0755,uid=0,gid=0 \
+            --tmpfs /work/mcp-temp:rw,noexec,nosuid,nodev,size=1m,mode=1777,uid=0,gid=0 \
+            --tmpfs /work/tunnel-temp:rw,noexec,nosuid,nodev,size=1m,mode=1777,uid=0,gid=0 \
+            --tmpfs /work/foreign:rw,noexec,nosuid,nodev,size=1m,mode=1777,uid=0,gid=0 \
+            --entrypoint bun "$IMAGE:$GITHUB_SHA" -e '
+            import assert from "node:assert/strict";
+            import { statSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+            try {
+              const { prepareRoot } = await import("/app/volume-init.mjs");
+              const metadata = path => {
+                const stat = statSync(path);
+                return [stat.uid, stat.gid, stat.mode & 0o7777];
+              };
+              const roots = ["/work/data", "/work/mcp-temp", "/work/tunnel-temp"];
+              for (const path of [...roots, "/work/foreign"]) {
+                assert(statSync(path).isDirectory());
+                assert.deepEqual(metadata(path), [0, 0, path === "/work/data" ? 0o755 : 0o1777]);
+                assert.deepEqual(readdirSync(path), []);
+              }
+              // The second CLI run must check existing private roots via O_PATH.
+              for (let attempt = 0; attempt < 2; attempt++) {
+                const result = Bun.spawnSync([process.execPath, "/app/volume-init.mjs", "roots"], {
+                  stdout: "ignore", stderr: "ignore",
+                });
+                assert.equal(result.exitCode, 0);
+                for (const path of roots) assert.deepEqual(metadata(path), [10000, 10000, 0o700]);
+              }
+              const foreign = "/work/foreign", sentinel = `${foreign}/sentinel`;
+              writeFileSync(sentinel, "synthetic-sentinel", { flag: "wx", mode: 0o600 });
+              const before = [metadata(foreign), metadata(sentinel)];
+              assert.throws(() => prepareRoot(foreign), /Private volume refused:/);
+              assert.deepEqual([metadata(foreign), metadata(sentinel)], before);
+              assert.deepEqual(readdirSync(foreign), ["sentinel"]);
+              assert.equal(readFileSync(sentinel, "utf8"), "synthetic-sentinel");
+              console.log("Root volume initialization regression passed.");
+            } catch {
+              console.error("Root volume initialization regression failed.");
+              process.exit(1);
+            }
+            '
+
       - name: Smoke test isolated image before publishing
         run: |
           set -euo pipefail
@@ -104,7 +152,7 @@ jobs:
           {
             printf '## MCP image published\n\n'
             printf -- '- Image: `%s`\n- Tag: `%s:%s`\n- Source SHA: `%s`\n- Platform: `linux/amd64`\n\n' "$image" "$IMAGE" "$GITHUB_SHA" "$GITHUB_SHA"
-            printf 'The isolated MCP health and LICENSE checks passed before push.\n\n'
+            printf 'The isolated root volume initialization regression, MCP health and LICENSE checks passed before push.\n\n'
             printf 'A new GHCR package defaults to **private**. On first publication, the owner must change package visibility to **public** in the GitHub UI, then independently verify anonymous digest pulls. Push success does not establish public access; this workflow does not change visibility.\n'
           } >> "$GITHUB_STEP_SUMMARY"
 

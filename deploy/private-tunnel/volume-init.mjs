@@ -31,7 +31,7 @@ export function prepareRoot(path) {
   try {
     const stat = fstatSync(pathFD);
     if (stat.uid === UID) { privateDir(stat); return; } // Never chown an existing application root.
-    if (!stat.isDirectory() || stat.uid !== 0 || stat.gid !== 0 || ![0o700, 0o755, 0o777].includes(stat.mode & 0o7777)) fail();
+    if (!stat.isDirectory() || stat.uid !== 0 || stat.gid !== 0 || ![0o700, 0o755, 0o777, 0o1777].includes(stat.mode & 0o7777)) fail();
     fd = openSync(at(pathFD), C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
     if (readdirSync(at(fd)).length !== 0) fail(); // Includes lost+found: provision an explicitly empty dedicated volume.
     fchmodSync(fd, 0o700);

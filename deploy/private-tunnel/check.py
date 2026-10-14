@@ -88,13 +88,14 @@ def check(base):
     require(isolation['podSelector'] == peer('hermes-mcp')['podSelector'] and isolation['policyTypes'] == ['Ingress', 'Egress'] and isolation['ingress'] == [] and len(isolation['egress']) == 3, 'MCP ingress denied; minimal egress only')
     dns, backend, public = isolation['egress']
     tcp8787 = [{'protocol': 'TCP', 'port': 8787}]
-    require(dns == {'to': [{'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': 'kube-system'}}, 'podSelector': {'matchLabels': {'k8s-app': 'kube-dns'}}}], 'ports': [{'protocol': 'UDP', 'port': 53}, {'protocol': 'TCP', 'port': 53}]} and backend == {'to': [peer('hermes-agent')], 'ports': tcp8787}, 'DNS/backend egress expanded')
+    gateway = {'podSelector': {'matchLabels': {'app.kubernetes.io/name': 'hermes-agent'}}}
+    require(dns == {'to': [{'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': 'kube-system'}}, 'podSelector': {'matchLabels': {'k8s-app': 'kube-dns'}}}], 'ports': [{'protocol': 'UDP', 'port': 53}, {'protocol': 'TCP', 'port': 53}]} and backend == {'to': [gateway], 'ports': tcp8787}, 'DNS/backend egress expanded')
     block = public['to'][0]['ipBlock']
     require(len(public['to']) == 1 and set(public['to'][0]) == {'ipBlock'} and block['cidr'] == '0.0.0.0/0' and public['ports'] == [{'protocol': 'TCP', 'port': 443}], 'public egress TCP443 only')
     exclusions = [ipaddress.ip_network(n) for n in block['except']]
     for n in ['0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24', '192.168.0.0/16', '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/3']:
         require(any(ipaddress.ip_network(n).subnet_of(e) for e in exclusions), 'nonpublic egress exclusion missing')
-    require(objects['NetworkPolicy', 'hermes-agent-from-hermes-mcp']['spec'] == {**peer('hermes-agent'), 'policyTypes': ['Ingress'], 'ingress': [{'from': [peer('hermes-mcp')], 'ports': tcp8787}]}, 'backend ingress same-namespace MCP only; do not edit old LAN rules')
+    require(objects['NetworkPolicy', 'hermes-agent-from-hermes-mcp']['spec'] == {**gateway, 'policyTypes': ['Ingress'], 'ingress': [{'from': [peer('hermes-mcp')], 'ports': tcp8787}]}, 'backend ingress same-namespace MCP only; do not edit old LAN rules')
     require(set(objects['ConfigMap', 'hermes-mcp']['data']) == {'private-owner', 'tunnel-id', 'file-origins'}, 'unexpected ConfigMap keys')
     placeholders = 'REPLACE_ME' in json.dumps(resources)
     print(f'STATIC PASS; placeholders {"remain: fill before use" if placeholders else "not found"}. Offline only; no deployment or runtime/ChatGPT validation.')

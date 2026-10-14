@@ -2,6 +2,7 @@
 **
 !package.json
 !bun.lock
+!LICENSE
 !src/
 !src/**
 !mcp/

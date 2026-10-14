@@ -1,0 +1,116 @@
+name: Publish MCP image
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'zjm54321/opencode-hermes-bridge'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
+      digest: ${{ steps.publish.outputs.digest }}
+      source_sha: ${{ steps.publish.outputs.source_sha }}
+    env:
+      IMAGE: ghcr.io/zjm54321/opencode-hermes-bridge-mcp
+      BUN_IMAGE: oven/bun:1.4.2@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895
+      DOCKER_CONFIG: ${{ runner.temp }}/hermes-mcp-docker
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Build linux/amd64 image from locked source
+        run: |
+          set -euo pipefail
+          # Use the runner's default Docker builder; no floating BuildKit image.
+          docker buildx build --platform linux/amd64 --load \
+            --file deploy/private-tunnel/Dockerfile \
+            --build-arg "BUN_IMAGE=$BUN_IMAGE" \
+            --tag "$IMAGE:$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/zjm54321/opencode-hermes-bridge" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.licenses=GPL-3.0-or-later" \
+            .
+
+      - name: Smoke test isolated image before publishing
+        run: |
+          set -euo pipefail
+          container="mcp-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          # Synthetic identity only. No network, host ports, host mounts or real jobs.
+          # McpState creates its own 0700 subdirectory inside this private tmpfs.
+          docker run --detach --name "$container" --network none \
+            --user 10000:10000 --read-only --cap-drop ALL \
+            --security-opt no-new-privileges=true \
+            --tmpfs /private:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=10000,gid=10000 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=10000,gid=10000 \
+            --env HERMES_MCP_PRIVATE_OWNER=ci-smoke-owner \
+            --env HERMES_MCP_TUNNEL_ID=tunnel_00000000000000000000000000000000 \
+            --env HERMES_MCP_STATE_DIR=/private/state \
+            --env HERMES_MCP_HOST=127.0.0.1 \
+            --env HERMES_MCP_PORT=8790 \
+            --env 'HERMES_MCP_FILE_ORIGINS=[]' \
+            --env HERMES_BRIDGE_URL=http://127.0.0.1:1 \
+            --env HERMES_BRIDGE_TOKEN=synthetic-ci-smoke-not-a-secret \
+            --env HERMES_BRIDGE_OUTPUT_DIR=/private/outputs \
+            "$IMAGE:$GITHUB_SHA"
+          ready=false
+          for attempt in {1..30}; do
+            # --live probes only MCP /health, not a real Tunnel or Hermes job.
+            if docker exec "$container" bun /app/probe.mjs --live; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            docker logs "$container"
+            exit 1
+          fi
+          docker exec "$container" bun -e 'process.stdout.write(await Bun.file("/app/LICENSE").text())' | cmp LICENSE -
+
+      - name: Log in to GHCR using the job token
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$DOCKER_CONFIG"
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Push SHA tag and record registry digest
+        id: publish
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE:$GITHUB_SHA"
+          image=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$GITHUB_SHA")
+          [[ "$image" == "$IMAGE"@sha256:* ]]
+          digest="${image#"$IMAGE"@}"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          printf 'image=%s\ndigest=%s\nsource_sha=%s\n' "$image" "$digest" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          {
+            printf '## MCP image published\n\n'
+            printf -- '- Image: `%s`\n- Tag: `%s:%s`\n- Source SHA: `%s`\n- Platform: `linux/amd64`\n\n' "$image" "$IMAGE" "$GITHUB_SHA" "$GITHUB_SHA"
+            printf 'The isolated MCP health and LICENSE checks passed before push.\n\n'
+            printf 'A new GHCR package defaults to **private**. On first publication, the owner must change package visibility to **public** in the GitHub UI, then independently verify anonymous digest pulls. Push success does not establish public access; this workflow does not change visibility.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove registry credentials
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f "$DOCKER_CONFIG/config.json" ]]; then
+            docker logout ghcr.io
+            rm -f -- "$DOCKER_CONFIG/config.json"
+          fi

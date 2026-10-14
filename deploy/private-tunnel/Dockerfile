@@ -12,6 +12,7 @@ COPY src ./src
 COPY mcp ./mcp
 RUN bun build mcp/index.ts --target=bun --outdir=/image-app
 COPY deploy/private-tunnel/volume-init.mjs deploy/private-tunnel/probe.mjs /image-app/
+COPY LICENSE /image-app/LICENSE
 
 FROM ${BUN_IMAGE} AS runtime
 WORKDIR /app

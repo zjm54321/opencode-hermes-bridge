@@ -20,7 +20,6 @@ jobs:
     env:
       IMAGE: ghcr.io/zjm54321/opencode-hermes-bridge-mcp
       BUN_IMAGE: oven/bun:1.4.2@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895
-      DOCKER_CONFIG: ${{ runner.temp }}/hermes-mcp-docker
     defaults:
       run:
         shell: bash
@@ -30,6 +29,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Select isolated Docker config at runtime
+        run: printf 'DOCKER_CONFIG=%s/hermes-mcp-docker\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Build linux/amd64 image from locked source
         run: |

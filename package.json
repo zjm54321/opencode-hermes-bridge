@@ -1,6 +1,6 @@
 {
   "name": "opencode-hermes-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Native OpenCode tools for collaborating with an existing Hermes Gateway, with durable jobs and original-file transfer.",
   "type": "module",
   "license": "GPL-3.0-or-later",

@@ -3,7 +3,7 @@
 
 本文档说明 `opencode-hermes-bridge` 的 npm 运行配置、本地打包验证、首次发布与 GitHub Actions OIDC 自动化发布流程。
 
-> **当前状态**：本地已完成完整的构建、打包、解包与临时 consumer 导入验证；**尚未在 npm 上实际发布，亦未在生产运行 OIDC 流程**。
+> **当前状态**：0.1.0 已公开发布，GitHub Trusted Publisher 已配置发布权限；0.1.1 仅用于首次 GitHub OIDC 自动发布验证与说明收口，**首次 CI 发布仍待验证**。
 
 ## 1. 架构定位与 OpenCode 配置
 
@@ -38,16 +38,16 @@
 仓库提供了自动化打包检查脚本 `scripts/package-native.mjs`，在 Node >= 22.14.0（当前环境为 Node 24 / Bun 1.4.2）下运行：
 
 ```bash
-nix develop --command node scripts/package-native.mjs /tmp/opencode/hermes-npm-release-0.1.0
+nix develop --command node scripts/package-native.mjs /tmp/opencode/hermes-npm-release-0.1.1
 ```
 
 - **执行约束**：指定的目标输出目录必须预先不存在，避免污染已有数据。
 - **校验流程**：脚本会在干净隔离目录中执行构建、生成真实 `.tgz` 压缩包、解包校验结构，并在临时 consumer 环境中通过独立 cache 与空 `.npmrc` 安装并验证 `import` 加载。
-- **产物位置**：产物输出于 `<outdir>/opencode-hermes-bridge-0.1.0.tgz` 与 `package-report.json`。该脚本不执行 `npm publish`，不覆盖仓库 `dist/`，无需 npm 登录态。
+- **产物位置**：产物输出于 `<outdir>/opencode-hermes-bridge-0.1.1.tgz` 与 `package-report.json`。该脚本不执行 `npm publish`，不覆盖仓库 `dist/`，无需 npm 登录态。
 
-## 3. 首次手动发布（v0.1.0）
+## 3. 首次手动发布（v0.1.0，已完成）
 
-由于 npm 远端尚无该包名，本流程由账户持有者在本地终端完成首次发布，再为已有包配置 Trusted Publisher：
+0.1.0 的首次发布与后续 Trusted Publisher 配置均已完成；以下仅保留首次发布流程说明，**不要重复发布 0.1.0**：
 
 1. 在终端交互登录 npm（**严禁在对话或公共渠道发送 Token 凭据**）：
    ```bash
@@ -64,7 +64,8 @@ nix develop --command node scripts/package-native.mjs /tmp/opencode/hermes-npm-r
 首次发布成功后，通过 npm 原生 Trusted Publisher 使用短期 OIDC 身份自动发布，无需保存长期 Token：
 
 1. **npm 设置**：
-   - 访问 npmjs 对应包页面的 `Settings` → `Trusted Publisher` → `GitHub Actions`。
+   - 官方 CLI（npm >= 11.15.0，需要 2FA，可按提示在浏览器确认）：`npm trust github opencode-hermes-bridge --repository zjm54321/opencode-hermes-bridge --file publish-npm.yml --allow-publish`。此包已配置，无需重复创建。
+   - 网页备选：访问 npmjs 对应包页面的 `Settings` → `Trusted Publisher` → `GitHub Actions`。
    - 填写信息：Owner/User `zjm54321`，Repository `opencode-hermes-bridge`，Workflow filename `publish-npm.yml`，Environment 留空。
    - **重要权限**：新添加的 Trusted Publisher 默认处于 "stage only" 状态，必须在 Allowed actions 中显式勾选允许 `npm publish`。
    - **时间窗口**：新建的 Publisher 必须在 2 天内完成首次成功发布，否则配置将自动过期失效。建议在准备发布下一个版本前再行创建。
@@ -76,4 +77,5 @@ nix develop --command node scripts/package-native.mjs /tmp/opencode/hermes-npm-r
 ## 5. 参考链接
 
 - [npm Trusted Publishers 官方文档](https://docs.npmjs.com/trusted-publishers)
+- [npm trust 官方 CLI 文档](https://docs.npmjs.com/cli/v11/commands/npm-trust)
 - [OpenCode Plugins 官方规范](https://opencode.ai/v2/docs/plugins/)

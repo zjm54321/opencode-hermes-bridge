@@ -1,10 +1,16 @@
 {
   "name": "opencode-hermes-bridge",
   "version": "0.1.0",
+  "description": "Native OpenCode tools for collaborating with an existing Hermes Gateway, with durable jobs and original-file transfer.",
   "type": "module",
   "license": "GPL-3.0-or-later",
+  "repository": { "type": "git", "url": "git+https://github.com/zjm54321/opencode-hermes-bridge.git" },
+  "homepage": "https://github.com/zjm54321/opencode-hermes-bridge#readme",
+  "bugs": { "url": "https://github.com/zjm54321/opencode-hermes-bridge/issues" },
+  "engines": { "node": ">=22.14.0" },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" },
   "exports": { ".": "./dist/index.js", "./core": "./dist/core.js", "./source": "./src/index.ts" },
-  "files": ["dist", "src"],
+  "files": ["dist", "src", "docs"],
   "scripts": {
     "test": "bun test tests/unit",
     "test:integration": "bun test tests/integration --only-failures",

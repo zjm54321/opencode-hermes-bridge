@@ -50,13 +50,13 @@ PYTHONPATH="$BRIDGE_REPO/companion${PYTHONPATH:+:$PYTHONPATH}" \
 
 ## 3. OpenCode V2 插件注册与配置
 
-插件使用 `@opencode/plugin 2.0.24` SDK。在 OpenCode 配置文件中通过原生 `plugins` 数组显式加载（不是 MCP server 配置）：
+插件使用 `@opencode/plugin 2.0.24` SDK。在 OpenCode 配置文件中通过原生 `plugins` 数组显式加载（不是 MCP server 配置）。支持在线 npm 包加载（发布后）或指向本地开发构建目录：
 
 ```json
 {
   "plugins": [
     {
-      "package": "/absolute/path/to/opencode-hermes-bridge/dist",
+      "package": "opencode-hermes-bridge@latest",
       "options": {
         "url": "http://127.0.0.1:8787",
         "tokenEnv": "HERMES_BRIDGE_TOKEN",
@@ -69,7 +69,7 @@ PYTHONPATH="$BRIDGE_REPO/companion${PYTHONPATH:+:$PYTHONPATH}" \
 }
 ```
 
-- `package` 必须直接指向构建产物目录 `dist`，加载器会探测目录内的 `index.js` 或 `server.js`；不指向仓库根目录或单个 `.js` 文件。
+- `package`：在线加载时填写 npm 包名（如 `opencode-hermes-bridge@latest` 或固定版本号）；本地开发调试可沿用构建产物目录的绝对路径，例如 `/absolute/path/to/opencode-hermes-bridge/dist`。从本地切换至 npm 时请**替换原有条目而非追加**，避免 Duplicate plugin ID。打包与发布流程见 [NPM 接入与发布指南](docs/NPM.md)。
 - 严禁在 `options` 中填写 `token`；`tokenEnv` 是承载 Bearer Token 的环境变量名称，默认 `HERMES_BRIDGE_TOKEN`。
 - `options` 优先于环境变量。`url` 对应 `HERMES_BRIDGE_URL`，仅允许无凭据、查询串或子路径的 HTTP(S) Origin；`uploadRoots` 对应 JSON 数组 `HERMES_BRIDGE_UPLOAD_ROOTS`，默认 `[]` 禁用本地路径读取，`base64` / `data` 不受路径白名单限制。
 - `outputDir` 对应 `HERMES_BRIDGE_OUTPUT_DIR`，默认 `$XDG_STATE_HOME/opencode-hermes-bridge/outputs`，缺省为 `~/.local/state/opencode-hermes-bridge/outputs`。路径相对当前工作区解析，推荐绝对路径。

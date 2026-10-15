@@ -18,19 +18,19 @@ python3 -B deploy/private-tunnel/check.py
 bun test deploy/private-tunnel/volume-init.test.mjs
 ```
 
-本轮统一验证的 28 项测试、主/MCP 类型检查、静态检查、plugin/MCP 隔离构建及 MCP bundle 启动 smoke 均通过，live dist 两项 SHA 保持不变；这些结果不代表真实 Tunnel/ChatGPT、root/CSI/PV 或生产部署验收。静态检查允许模板占位值并提醒填写，不执行部署；初始化 fixture 不替代真实 root/CSI/PV 验证。
+历史统一验证记录包含 28 项基线测试。本轮针对来源说明功能，主工程/MCP 类型检查、7 项单元测试、7 项 MCP 测试与 2 项集成测试（共 16 项）及双隔离构建均通过，Python/deploy 复用既有验证证据；测试与构建阶段未修改 live dist，验收后另行更新了运行版本。
 
 ## 已有事实
 
-- 原生产 Sidecar 文本/图片链路此前已通，直连原 Gateway，保留原 profile。
-- 真实隔离 OpenCode 2.0.27 曾通过 MCP 工具与 `read_mcp_resource` 收到 318 字节 ZIP，解码后原件 SHA-256 一致。**该 ZIP 验收的 Gateway/model 是 fixture**，不代表真实模型生成文件或真实 ChatGPT 验收；宿主 `automaticFileSave=false`。
-- 当前完整文件 Companion / `hermes_file_plugin` 与 MCP 仍为未部署源码，生产仍是此前文本/图片 Sidecar。
+- 原生产 Gateway 保留原 profile，文本/图片链路与 `hermes_file_plugin` 均已上线。
+- 真实隔离 OpenCode 2.0.27 曾通过 MCP 工具与 `read_mcp_resource` 收到 318 字节 ZIP；该次 Gateway/model 为 fixture，未自动保存文件。后续生产链路中 OpenCode 已成功完成 162 字节原 ZIP 往返并保存原件（SHA-256 为 `759dab247ae6e26389fea5716a439beaa128485bfc8c0c37c77b61881922e0e4`）。
+- 来源说明上线后，OpenCode 仅重启一次，95 个插件恢复正常、服务配置未变；真实请求中 Hermes 正确识别了 OpenCode、编程用途及代理转交身份。
+- 私有 Tunnel 具备上一轮真实的 ChatGPT 文字链路验证；本轮部署（source `6395de7`、GitOps `f23a344a`、MCP 镜像 `c08e3794e88604225339bbf2fff3818b423c4792b33993b89e71a1ff864e76af`）经 runtime bundle 与健康检查均通过，本轮未再次发起 ChatGPT 调用。
+- 专属 PV Bound、private 700、uid 10000 运行与 root init 容器曾通过真实 CI 与线上环境验证（但不代表覆盖所有第三方 CSI/CNI 组合与文件类型）。
 
 ## 未验事项与发布前提
 
-- 真实 ChatGPT Tunnel、账户权限、附件自动绑定与原件读取/保存行为尚未验收；传输成功不等于模型理解内容或客户端自动落盘。
-- root→10000 权限处理、真实 CSI/PV、目标 CNI 与 DNS/后端/出站规则尚未实测。
-- 完整文件功能需另行在保留原 profile/身份前提下升级后端并安装启用文件插件。`GET /v1/capabilities` 的 `assets: true` 只证明资产接口开启，不证明插件启用或模型成功调用。
-- 模板的 owner、Tunnel ID、独立存储、可信镜像 digest 与外部 Secret 须在实际使用前填写并核对；文字-only 验收不能宣称完整文件就绪。
+- 真实 ChatGPT 侧的附件自动绑定、原件读取与自动保存行为仍未实测；传输成功不等于模型能正确理解内容。
+- 生产特化配置（如专属 owner、Tunnel ID 与外部 Secret）不作为通用部署模板的默认保证，使用模板前仍须核对填写。
 
 配置见 [私有隧道指南](PRIVATE_TUNNEL.md)；原件传输与插件前提见 [文件指南](FILE_TRANSFER.md)；未知提交不重投、凭据 scope 与旧 jobs 保护见 [通信协议](PROTOCOL.md)。

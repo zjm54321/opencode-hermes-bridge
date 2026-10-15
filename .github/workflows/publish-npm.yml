@@ -57,6 +57,7 @@ jobs:
       - name: Check locked native source
         run: |
           set -euo pipefail
+          mkdir -p /tmp/opencode
           bun install --frozen-lockfile --ignore-scripts
           bun run typecheck
           bun test tests/unit

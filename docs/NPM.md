@@ -3,7 +3,7 @@
 
 本文档说明 `opencode-hermes-bridge` 的 npm 运行配置、本地打包验证、首次发布与 GitHub Actions OIDC 自动化发布流程。
 
-> **当前状态**：0.1.0 已公开发布，GitHub Trusted Publisher 已配置发布权限；0.1.1 仅用于首次 GitHub OIDC 自动发布验证与说明收口，**首次 CI 发布仍待验证**。
+> **当前状态**：0.1.0 已在 npm 公开发布，GitHub Trusted Publisher 已配置发布权限；0.1.1 的 GitHub CI 因测试临时目录缺失而失败，未执行发布；0.1.2 修复 CI 目录准备，**首次 OIDC 发布仍待下轮 CI 验证**。
 
 ## 1. 架构定位与 OpenCode 配置
 
@@ -38,12 +38,12 @@
 仓库提供了自动化打包检查脚本 `scripts/package-native.mjs`，在 Node >= 22.14.0（当前环境为 Node 24 / Bun 1.4.2）下运行：
 
 ```bash
-nix develop --command node scripts/package-native.mjs /tmp/opencode/hermes-npm-release-0.1.1
+nix develop --command node scripts/package-native.mjs /tmp/opencode/hermes-npm-release-0.1.2
 ```
 
 - **执行约束**：指定的目标输出目录必须预先不存在，避免污染已有数据。
 - **校验流程**：脚本会在干净隔离目录中执行构建、生成真实 `.tgz` 压缩包、解包校验结构，并在临时 consumer 环境中通过独立 cache 与空 `.npmrc` 安装并验证 `import` 加载。
-- **产物位置**：产物输出于 `<outdir>/opencode-hermes-bridge-0.1.1.tgz` 与 `package-report.json`。该脚本不执行 `npm publish`，不覆盖仓库 `dist/`，无需 npm 登录态。
+- **产物位置**：产物输出于 `<outdir>/opencode-hermes-bridge-0.1.2.tgz` 与 `package-report.json`。该脚本不执行 `npm publish`，不覆盖仓库 `dist/`，无需 npm 登录态。
 
 ## 3. 首次手动发布（v0.1.0，已完成）
 

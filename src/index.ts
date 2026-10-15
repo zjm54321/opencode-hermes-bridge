@@ -1,6 +1,7 @@
 import { Plugin } from '@opencode/plugin'
 import { Bridge, config, waitSeconds } from './core.js'
 import { record, uuid } from './protocol.js'
+import { agentContext } from './agent-context.js'
 
 const attachmentSchema = {
   type: 'object', additionalProperties: false,
@@ -51,8 +52,9 @@ export default Plugin.define({
         input: { type: 'object', additionalProperties: false, required: ['text'], properties: { text: { type: 'string', description: 'Request to Hermes, at most 64 KiB UTF-8.' }, attachments: { type: 'array', maxItems: 8, items: attachmentSchema, description: 'Native PNG/JPEG/GIF/WebP images only. Use files for ordinary binary files.' }, files: { type: 'array', maxItems: 8, items: fileSchema }, requireFiles: { type: 'boolean', description: 'Require file-capable execution, including when requesting output files with no input file. Unsupported companions fail before model submission.' }, waitSeconds: waitSchema } },
         async execute(input, context) {
           if (!bridge) return unavailable()
-          const seconds = waitSeconds(record(input).waitSeconds, 30)
-          const job = await bridge.ask(context.sessionID, input, context.signal)
+          const r = record(input)
+          const seconds = waitSeconds(r.waitSeconds, 30)
+          const job = await bridge.ask(context.sessionID, { ...r, text: agentContext('opencode', r.text) }, context.signal)
           return bridge.result(context.sessionID, job.id, { waitSeconds: seconds, signal: context.signal })
         },
       })

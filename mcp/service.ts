@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { isAbsolute, resolve } from 'node:path'
 import { Bridge, waitSeconds, type Config, type OutboxJob } from '../src/core.js'
 import { hashBytes, LIMITS, mime, name, record, text, uuid } from '../src/protocol.js'
+import { agentContext } from '../src/agent-context.js'
 import { invalidInput, McpError, resourceIdentity, unavailable, type FileRef, type NormalizedFile, type Principal, type PublicFile, type PublicResult, type SubmitInput } from './contracts.js'
 import { McpOutputs } from './outputs.js'
 import { McpState, privateDirectory } from './state.js'
@@ -98,6 +99,9 @@ export class McpBridgeService {
         return existing.jobId
       }
       if (input.thread_id && e.threads[input.thread_id]?.owner !== this.state.owner) throw new McpError(404, 'not_found', 'Thread not found')
+      let message: string
+      try { message = agentContext('chatgpt', input.text) }
+      catch { throw new McpError(400, 'invalid_input', 'Task text including agent context must fit within 64 KiB UTF-8') }
       const threadId = input.thread_id ?? randomUUID(), sessionID = `${this.state.owner}:${threadId}`
       let files: { name: string; mime: string; base64: string }[] = []
       if (input.file) {
@@ -110,7 +114,7 @@ export class McpBridgeService {
       }
       this.state.begin({ requestId: input.request_id, fingerprint: input.fingerprint, threadId, sessionID })
       try {
-        const job = await this.bridge.ask(sessionID, { text: input.text, files, requireFiles: input.require_files })
+        const job = await this.bridge.ask(sessionID, { text: message, files, requireFiles: input.require_files })
         return job.id
       } catch { throw unavailable() }
       finally { this.state.cancelAdmission() }

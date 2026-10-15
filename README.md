@@ -3,7 +3,9 @@
 
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
-OpenCode 原生工具和 ChatGPT 私有 MCP 隧道连接同一个 Hermes Gateway，支持文字、图片和原文件双向传输。长任务通过状态查询与结果工具取回，不新建 Agent 或 profile。当前完整文件功能和 MCP 仍是未部署源码。
+OpenCode 原生工具和 ChatGPT 私有 MCP 隧道连接同一个 Hermes Gateway。长任务通过状态查询与结果工具取回，不新建 Agent 或 profile。OpenCode 的原字节文件通道与 ChatGPT 私有 MCP 已部署；ChatGPT 自动文件交接仍待实测。
+
+本轮源码在新任务入队前按 OpenCode / ChatGPT 入口自动添加固定代理与能力说明，并在 `[任务正文]` 后逐字保留原文；64 KiB UTF-8 文字限额包含说明。说明只供理解任务来源，不属于身份认证或权限授予，不改变记忆身份，也不补写旧任务；此说明功能尚未部署。
 
 - 开源协议：GPL-3.0-or-later
 - 代码仓库：[https://github.com/zjm54321/opencode-hermes-bridge](https://github.com/zjm54321/opencode-hermes-bridge)
@@ -98,4 +100,4 @@ PYTHONPATH="$BRIDGE_REPO/companion${PYTHONPATH:+:$PYTHONPATH}" \
 - Companion 与 MCP 不是 Hermes 系统权限沙箱；Hermes 仍拥有宿主赋予的工具权限。
 - 复用原 Gateway 与 profile 不保证不同渠道共享同一聊天 session 或 Honcho peer；长期身份与账户权限须另行核对，不自动合并其他用户记忆。
 - Bridge HTTP 仅用于受信网络并配置访问控制；不可信网络需要 TLS 或加密隧道，严禁直接暴露管理端口。
-- 原生产 Sidecar 的文字/图片链路此前已通；完整文件后端与 MCP 尚未上线，真实 ChatGPT Tunnel/账户/文件绑定仍待验收。历史宿主 ZIP 验证的 fixture 边界与检查命令见 [验证现状](docs/VERIFICATION.md)。
+- 已完成 OpenCode 原字节 ZIP 往返及 ChatGPT 私有 Tunnel 文字调用；ChatGPT 自动文件交接仍待实测。本轮来源说明尚未上线；历史隔离测试边界与检查命令见 [验证现状](docs/VERIFICATION.md)。

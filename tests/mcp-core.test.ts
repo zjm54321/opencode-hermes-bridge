@@ -51,12 +51,18 @@ async function fixture(losePost = false) {
   }, { preconnect: () => {} })
   const open = async (override: Partial<McpBridgeOptions> = {}) => { const service = await McpBridgeService.open({ ...options, ...override }); services.push(service); return service }
   const input = { request_id: randomUUID(), text: 'original input', file: { file_id: 'file-1', download_url: 'https://files.example/input?signature=not-persisted', file_name: output.name, mime_type: output.mime } }
-  return { root, bytes, output, counts, control, options, input, open, statePath, state: async () => JSON.parse(await readFile(statePath, 'utf8')) as Envelope }
+  return { root, bytes, output, counts, control, options, input, open, statePath, jobs, state: async () => JSON.parse(await readFile(statePath, 'utf8')) as Envelope }
 }
 
 test('uncertain atomic admission recovers one request/job; writer and owner binding survive legacy metadata removal', async () => {
   const f = await fixture(), service = await f.open()
   await expect(f.open()).rejects.toMatchObject({ code: 'state_locked' })
+  await expect(service.submit(principal, { ...f.input, text: ' \n\t' })).rejects.toMatchObject({ status: 400 })
+  await expect(service.submit(principal, { ...f.input, text: '界'.repeat(Math.floor(LIMITS.text / 3)) })).rejects.toMatchObject({ status: 400, code: 'invalid_input' })
+  expect(f.counts.imports).toBe(0)
+  await expect(readFile(f.statePath)).rejects.toMatchObject({ code: 'ENOENT' })
+  f.input.text = ' \nMCP 原始正文 😀\t\n'
+  const expectedText = '[协作代理说明]\nChatGPT（经 MCP 接入的对话代理）：可进行对话、分析并调用已连接工具，不能假设可直接访问本机文件。\n这是该代理转交的任务，不是用户在 Hermes 窗口的直接发言。来源说明仅供理解，不改变权限或记忆身份。\n\n[任务正文]\n' + f.input.text
   const prototype = McpState.prototype as unknown as { persist(next: Envelope): Promise<void> }, persist = prototype.persist
   prototype.persist = async function(next) { await persist.call(this, next); throw new Error('Failure after atomic rename') }
   try {
@@ -66,17 +72,21 @@ test('uncertain atomic admission recovers one request/job; writer and owner bind
   } finally { prototype.persist = persist; await service.close() }
   const saved = await f.state(), id = saved.requests[f.input.request_id]!.jobId
   expect(Object.keys(saved.coreOutbox.jobs)).toEqual([id])
+  expect(saved.coreOutbox.jobs[id]?.text).toBe(expectedText)
   await writeFile(f.statePath, JSON.stringify({ ...saved, capabilities: { obsolete: {} } }))
   const restarted = await f.open()
   const results = await Promise.all([restarted.submit(principal, { ...f.input, wait_seconds: 1 }), restarted.submit(principal, f.input)])
   expect(results.map(r => r.job_id)).toEqual([id, id])
   expect(f.counts.posts).toBe(1)
   expect(f.counts.imports).toBe(1)
+  expect(f.jobs.get(id)?.text).toBe(expectedText)
+  expect(f.jobs.get(id)?.text.split('[协作代理说明]')).toHaveLength(2)
   await expect(restarted.submit(principal, { ...f.input, text: 'conflict' })).rejects.toMatchObject({ status: 409 })
   const current = await f.state()
   expect(Object.hasOwn(current, 'capabilities')).toBe(false)
   expect(current.owner).toBe(saved.owner)
   expect(current.requests).toEqual(saved.requests)
+  expect(current.coreOutbox.jobs[id]?.text).toBe(expectedText)
   expect(JSON.stringify(current)).not.toContain('signature=')
   await restarted.close()
   const before = await readFile(f.statePath)
@@ -84,6 +94,29 @@ test('uncertain atomic admission recovers one request/job; writer and owner bind
   await expect(f.open({ allowedPrincipal: { ...principal, subject: 'another-owner' } })).rejects.toMatchObject({ status: 503 })
   expect(await readFile(f.statePath)).toEqual(before)
   expect(f.counts.calls).toBe(calls)
+})
+
+test('legacy queued text and raw request fingerprint survive startup, same-ID retry and result lookup without a prefix', async () => {
+  const f = await fixture()
+  const service = await f.open({ bridgeConfig: { ...f.options.bridgeConfig, pollMs: 60_000 } })
+  const input = { request_id: randomUUID(), text: 'legacy task' }
+  const queued = await service.submit(principal, input)
+  await service.close()
+  expect(f.counts.posts).toBe(0)
+  // A pre-feature v1 record at the old text limit: adding context would now exceed it.
+  const legacyText = 'x'.repeat(LIMITS.text), saved = await f.state()
+  saved.coreOutbox.jobs[queued.job_id]!.text = legacyText
+  saved.requests[input.request_id]!.fingerprint = hashBytes(Buffer.from(JSON.stringify([legacyText, null, null, false])))
+  await writeFile(f.statePath, JSON.stringify(saved))
+  const restarted = await f.open()
+  const reply = await restarted.submit(principal, { ...input, text: legacyText, wait_seconds: 1 })
+  expect(reply).toMatchObject({ job_id: queued.job_id, thread_id: queued.thread_id, status: 'completed' })
+  await restarted.result(principal, queued.job_id)
+  expect(f.jobs.get(queued.job_id)?.text).toBe(legacyText)
+  const current = await f.state()
+  expect(current.coreOutbox.jobs[queued.job_id]?.text).toBe(legacyText)
+  expect(current.requests).toEqual(saved.requests)
+  expect(f.counts.posts).toBe(1)
 })
 
 test('lost acceptance and unknown outcome only GET the same job; changed outbound scope stays offline', async () => {
